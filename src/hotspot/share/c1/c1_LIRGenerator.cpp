@@ -907,8 +907,9 @@ void LIRGenerator::profile_branch(If* if_instr, If::Condition cond) {
     ciMethodData* md = method->method_data_or_null();
     assert(md != nullptr, "Sanity");
     ciProfileData* data = md->bci_to_data(if_instr->profiled_bci());
-    assert(data != nullptr, "must have profiling data");
-    assert(data->is_BranchData(), "need BranchData for two-way branches");
+    if (data == nullptr || !data->is_BranchData()) {
+      return;
+    }
     int taken_count_offset     = md->byte_offset_of_slot(data, BranchData::taken_offset());
     int not_taken_count_offset = md->byte_offset_of_slot(data, BranchData::not_taken_offset());
     if (if_instr->is_swapped()) {
