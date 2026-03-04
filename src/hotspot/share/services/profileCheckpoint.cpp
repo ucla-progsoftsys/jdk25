@@ -993,7 +993,11 @@ ProfileCheckpoint::Loader::LoadResult ProfileCheckpoint::Loader::load_from_file(
 
   JavaThread* THREAD = _thread; // For exception macros.
 
-  // preload all classes
+  // Two-pass class preload:
+  // Pass 1: resolve all regular (non-hidden) classes first, so they're available
+  //         in ClassLoaderDataGraph when DynoLocatorScan resolves hidden classes.
+  // Pass 2: resolve hidden classes (locators like @bci/@cpi that reference
+  //         enclosing classes loaded in pass 1).
   int classes_total = classes.length();
   int classes_resolved = 0;
   int classes_initialized = 0;
@@ -1002,15 +1006,14 @@ ProfileCheckpoint::Loader::LoadResult ProfileCheckpoint::Loader::load_from_file(
   int classes_hidden = 0;
   int classes_hidden_resolved = 0;
   int classes_linked_only = 0;
-  for (int ci = 0; ci < classes.length(); ci++) {
+
+  // Helper lambda for resolving and initializing/linking a class entry
+  auto resolve_class_entry = [&](int ci) {
     const ProfileCheckpoint::Class& cls = classes.at(ci);
-    if ((int)cls.klass.id >= symtab.length()) {
-      continue;
-    }
+    if ((int)cls.klass.id >= symtab.length()) return;
     const char* cname = symtab.at((int)cls.klass.id);
     bool is_hidden_locator = (cls.loader == LoaderId::HIDDEN) || (cname != nullptr && cname[0] == '@');
     if (is_hidden_locator) classes_hidden++;
-    // Get loader name from symtab if it's a NAMED loader
     const char* loader_name = nullptr;
     if (cls.loader == LoaderId::NAMED && cls.loader_name.id != 0xFFFFFFFF) {
       if ((int)cls.loader_name.id >= 0 && (int)cls.loader_name.id < symtab.length()) {
@@ -1021,10 +1024,6 @@ ProfileCheckpoint::Loader::LoadResult ProfileCheckpoint::Loader::load_from_file(
     if (holder != nullptr) {
       classes_resolved++;
       if (is_hidden_locator) classes_hidden_resolved++;
-      // Only initialize classes from built-in loaders (BOOT, PLATFORM, SYSTEM).
-      // Custom/NAMED loader classes may have <clinit> dependencies that aren't
-      // available yet. A failed <clinit> permanently marks the class as erroneous.
-      // install_record() will initialize specific holders on demand for compilation.
       bool safe_to_init = (cls.loader == LoaderId::BOOT ||
                            cls.loader == LoaderId::PLATFORM ||
                            cls.loader == LoaderId::SYSTEM);
@@ -1052,7 +1051,29 @@ ProfileCheckpoint::Loader::LoadResult ProfileCheckpoint::Loader::load_from_file(
       log_info(compilation)("MDO checkpoint: resolve FAILED for %s (loader=%d, hidden=%s)",
                             cname, (int)cls.loader, is_hidden_locator ? "yes" : "no");
     }
+  };
+
+  // Pass 1: regular classes (non-hidden)
+  for (int ci = 0; ci < classes.length(); ci++) {
+    if ((int)classes.at(ci).klass.id >= symtab.length()) continue;
+    const char* cname = symtab.at((int)classes.at(ci).klass.id);
+    bool is_hidden = (classes.at(ci).loader == LoaderId::HIDDEN) || (cname != nullptr && cname[0] == '@');
+    if (!is_hidden) {
+      resolve_class_entry(ci);
+    }
   }
+  log_info(compilation)("MDO checkpoint: pass 1 (regular classes) done: resolved=%d", classes_resolved);
+
+  // Pass 2: hidden classes (now enclosing classes are loaded)
+  for (int ci = 0; ci < classes.length(); ci++) {
+    if ((int)classes.at(ci).klass.id >= symtab.length()) continue;
+    const char* cname = symtab.at((int)classes.at(ci).klass.id);
+    bool is_hidden = (classes.at(ci).loader == LoaderId::HIDDEN) || (cname != nullptr && cname[0] == '@');
+    if (is_hidden) {
+      resolve_class_entry(ci);
+    }
+  }
+
   log_info(compilation)("MDO checkpoint: class preload summary: total=%d resolved=%d initialized=%d "
                          "init_failed=%d linked_only=%d resolve_failed=%d hidden=%d hidden_resolved=%d",
                          classes_total, classes_resolved, classes_initialized,
