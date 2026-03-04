@@ -28,6 +28,7 @@
 #include "oops/resolvedIndyEntry.hpp"
 #include "prims/methodHandles.hpp"
 #include "ci/ciReplay.hpp"
+#include "classfile/classLoader.hpp"
 #include "services/dynoLocatorScan.hpp"
 #include <cstdio>
 #include <cstring>
@@ -647,6 +648,20 @@ static void apply_fixups(MethodData* mdo,
 // ============================================================================
 // Load/install path (validate header, install records into live MDOs)
 // ============================================================================
+static bool validate_mdo_bcis(MethodData* mdo, Method* method) {
+  int code_size = method->code_size();
+  for (ProfileData* data = mdo->first_data();
+       mdo->is_valid(data);
+       data = mdo->next_data(data)) {
+    int bci = data->bci();
+    if (bci < 0 || bci >= code_size) {
+      log_debug(compilation)("MDO checkpoint: invalid BCI %d (code_size=%d)", bci, code_size);
+      return false;
+    }
+  }
+  return true;
+}
+
 static bool copy_mdo_payload(MethodData* dst_mdo, const char* src_bytes, u4 src_size) {
   if (dst_mdo == nullptr) return false;
   if ((u4)dst_mdo->size_in_bytes() != src_size) return false;
@@ -827,17 +842,34 @@ bool ProfileCheckpoint::Loader::install_record(const Record& rec,
     return false;
   }
 
+  bool mdo_valid = true;
+
+  if (rec.key.bytecode_crc32 != 0) {
+    uint32_t current_crc = (uint32_t)ClassLoader::crc32(0, (const char*)target->code_base(), target->code_size());
+    if (current_crc != rec.key.bytecode_crc32) {
+      log_debug(compilation)("MDO checkpoint: bytecode CRC32 mismatch for %s %s %s (stored=0x%08x current=0x%08x)",
+                             kname, mname, msig, rec.key.bytecode_crc32, current_crc);
+      mdo_valid = false;
+    }
+  }
+
   if (header_bytes != nullptr) {
     if (rec.header_size == sizeof(MethodData::HeaderSnapshot)) {
       MethodData::HeaderSnapshot snapshot;
       Copy::conjoint_jbytes(header_bytes, (char*)&snapshot, rec.header_size);
       if (!mdo->restore_header(snapshot)) {
         log_debug(compilation)("MDO checkpoint: header restore mismatch for %s %s %s", kname, mname, msig);
+        mdo_valid = false;
       }
     } else {
       log_debug(compilation)("MDO checkpoint: header size mismatch for %s %s %s (rec=%u expected=%zu)",
                              kname, mname, msig, rec.header_size, sizeof(MethodData::HeaderSnapshot));
+      mdo_valid = false;
     }
+  }
+
+  if (mdo_valid) {
+    mdo_valid = validate_mdo_bcis(mdo, target);
   }
 
   sanitize_type_entries(mdo);
@@ -871,7 +903,11 @@ bool ProfileCheckpoint::Loader::install_record(const Record& rec,
     }
   }
 
-  trigger_eager_compile(target, rec.comp_level, THREAD);
+  if (mdo_valid) {
+    trigger_eager_compile(target, rec.comp_level, THREAD);
+  } else {
+    log_debug(compilation)("MDO checkpoint: skipping eager compile for %s %s %s (invalid MDO)", kname, mname, msig);
+  }
 
   if (PrintMDOAfterLoad) {
     tty->print_cr("[AfterLoad] %s %s %s", kname, mname, msig);
@@ -1213,7 +1249,7 @@ void ProfileCheckpoint::dump_to_stream(fileStream* out) {
       rec.key.klass.id = stb.id_of(rec_meta.kname);
       rec.key.name.id  = stb.id_of(rec_meta.mname);
       rec.key.sig.id   = stb.id_of(rec_meta.sig);
-      rec.key.bytecode_crc32 = 0;
+      rec.key.bytecode_crc32 = (uint32_t)ClassLoader::crc32(0, (const char*)m->code_base(), m->code_size());
       rec.mdo_size = rec_meta.mdo_size;
       rec.comp_level = rec_meta.comp_level;
       GrowableArray<Fixup>* fx_entries = fixups_per_rec.at(ri);
