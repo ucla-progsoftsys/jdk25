@@ -635,6 +635,8 @@ static void apply_fixups(MethodData* mdo,
     }
     InstanceKlass* k = resolve_klass_utf8(cname, fx.loader, loader_name, THREAD);
     if (k != nullptr) {
+      k->initialize(THREAD);
+      if (HAS_PENDING_EXCEPTION) { CLEAR_PENDING_EXCEPTION; continue; }
       address cell_addr = (address)mdo + fx.offset_in_mdo;
       intptr_t* cell = (intptr_t*)cell_addr;
       *cell = TypeEntries::with_status(InstanceKlass::cast(k), *cell);
@@ -678,6 +680,8 @@ static void trigger_eager_compile(Method* target, u1 stored_level, JavaThread* t
   if (target == nullptr || thread == nullptr) return;
   if (!UseCompiler || !CompilationPolicy::is_compilation_enabled()) return;
   if (target->is_abstract() || target->is_native()) return;
+  InstanceKlass* holder = target->method_holder();
+  if (!holder->is_initialized()) return;
   CompLevel level = (CompLevel)stored_level;
   if (level < CompLevel_none) {
     level = CompLevel_none;
@@ -821,7 +825,7 @@ bool ProfileCheckpoint::Loader::install_record(const Record& rec,
     return false;
   }
 
-  holder->link_class(THREAD);
+  holder->initialize(THREAD);
   if (HAS_PENDING_EXCEPTION) { CLEAR_PENDING_EXCEPTION; }
 
   if (target->method_data() == nullptr) {
@@ -998,20 +1002,17 @@ ProfileCheckpoint::Loader::LoadResult ProfileCheckpoint::Loader::load_from_file(
     }
     InstanceKlass* holder = resolve_klass_utf8(cname, cls.loader, loader_name, THREAD);
     if (holder != nullptr) {
-      holder->link_class(THREAD);
-      if (HAS_PENDING_EXCEPTION) { CLEAR_PENDING_EXCEPTION; }
-      classes_linked++;
-
-      if (EagerInitAfterLoad && !holder->is_initialized()) {
-        log_debug(compilation)("MDO checkpoint: eagerly initializing %s", cname);
-        holder->initialize(THREAD);
-        if (HAS_PENDING_EXCEPTION) {
-          log_debug(compilation)("MDO checkpoint: eager init failed for %s", cname);
-          CLEAR_PENDING_EXCEPTION;
-          classes_init_failed++;
-        } else {
-          classes_initialized++;
-        }
+      holder->initialize(THREAD);
+      if (HAS_PENDING_EXCEPTION) {
+        log_debug(compilation)("MDO checkpoint: init failed for %s, falling back to link", cname);
+        CLEAR_PENDING_EXCEPTION;
+        holder->link_class(THREAD);
+        if (HAS_PENDING_EXCEPTION) { CLEAR_PENDING_EXCEPTION; }
+        classes_linked++;
+        classes_init_failed++;
+      } else {
+        classes_linked++;
+        classes_initialized++;
       }
     } else {
       log_debug(compilation)("MDO checkpoint: preload class failed for %s (loader=%d)",
