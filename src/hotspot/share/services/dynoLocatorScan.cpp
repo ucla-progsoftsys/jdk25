@@ -61,7 +61,7 @@ public:
     log_debug(compilation)("recording ik: %s with name %s", ik->name()->as_utf8(), loc);
     if (ik == nullptr || loc == nullptr) return;
     ensure_init();
-    MutexLocker ml(_lock, Mutex::_no_safepoint_check_flag);
+    MutexLocker ml(_lock);
     for (int i = 0; i < _entries->length(); i++) {
       if (_entries->at(i)._ik == ik) return;
     }
@@ -70,7 +70,7 @@ public:
   }
   static const char* lookup(InstanceKlass* ik) {
     if (_entries == nullptr || ik == nullptr) return nullptr;
-    MutexLocker ml(_lock, Mutex::_no_safepoint_check_flag);
+    MutexLocker ml(_lock);
     for (int i = 0; i < _entries->length(); i++) {
       if (_entries->at(i)._ik == ik) return _entries->at(i)._loc;
     }
@@ -198,8 +198,12 @@ class HiddenLocatorParser {
     Symbol* mnsym = SymbolTable::new_symbol(mname);
     Symbol* mssym = SymbolTable::new_symbol(msig);
     Handle loader(_jt, SystemDictionary::java_system_loader());
-    InstanceKlass* ik = InstanceKlass::cast(SystemDictionary::resolve_or_fail(ksym, loader, true, _jt));
+    Klass* resolved_klass = SystemDictionary::resolve_or_fail(ksym, loader, true, _jt);
     if (_jt->has_pending_exception()) { _jt->clear_pending_exception(); return nullptr; }
+    if (resolved_klass == nullptr || !resolved_klass->is_instance_klass()) {
+      return nullptr;
+    }
+    InstanceKlass* ik = InstanceKlass::cast(resolved_klass);
     ik->link_class(_jt);
     if (_jt->has_pending_exception()) { _jt->clear_pending_exception(); return nullptr; }
     Method* m = ik->find_method(mnsym, mssym);
@@ -286,8 +290,12 @@ class HiddenLocatorParser {
     if (!ok || klass == nullptr) return nullptr;
     Symbol* ksym = SymbolTable::new_symbol(klass);
     Handle loader(_jt, SystemDictionary::java_system_loader());
-    InstanceKlass* ik = InstanceKlass::cast(SystemDictionary::resolve_or_fail(ksym, loader, true, _jt));
+    Klass* resolved_klass = SystemDictionary::resolve_or_fail(ksym, loader, true, _jt);
     if (_jt->has_pending_exception()) { _jt->clear_pending_exception(); return nullptr; }
+    if (resolved_klass == nullptr || !resolved_klass->is_instance_klass()) {
+      return nullptr;
+    }
+    InstanceKlass* ik = InstanceKlass::cast(resolved_klass);
     ik->link_class(_jt);
     if (_jt->has_pending_exception()) { _jt->clear_pending_exception(); return nullptr; }
     const constantPoolHandle cp(_jt, ik->constants());

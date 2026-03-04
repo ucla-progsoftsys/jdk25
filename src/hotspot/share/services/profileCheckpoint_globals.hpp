@@ -30,7 +30,10 @@
           "Debug: print MethodData/MethodCounters after loading each method")  \
                                                                                \
   product(bool, EagerCompileAfterLoad, false, DIAGNOSTIC,                      \
-          "After loading MDOs at startup, run eager compilation")
+          "After loading MDOs at startup, run eager compilation")           \
+                                                                               \
+  product(bool, EagerInitAfterLoad, false, DIAGNOSTIC,                        \
+          "After loading MDOs, eagerly initialize all referenced classes")
 
 DECLARE_FLAGS(PROFILECHECKPOINT_FLAGS)
 

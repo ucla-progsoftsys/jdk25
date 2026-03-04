@@ -980,6 +980,9 @@ ProfileCheckpoint::Loader::LoadResult ProfileCheckpoint::Loader::load_from_file(
   JavaThread* THREAD = _thread; // For exception macros.
 
   // preload all classes
+  int classes_linked = 0;
+  int classes_initialized = 0;
+  int classes_init_failed = 0;
   for (int ci = 0; ci < classes.length(); ci++) {
     const ProfileCheckpoint::Class& cls = classes.at(ci);
     if ((int)cls.klass.id >= symtab.length()) {
@@ -997,11 +1000,26 @@ ProfileCheckpoint::Loader::LoadResult ProfileCheckpoint::Loader::load_from_file(
     if (holder != nullptr) {
       holder->link_class(THREAD);
       if (HAS_PENDING_EXCEPTION) { CLEAR_PENDING_EXCEPTION; }
+      classes_linked++;
+
+      if (EagerInitAfterLoad && !holder->is_initialized()) {
+        log_debug(compilation)("MDO checkpoint: eagerly initializing %s", cname);
+        holder->initialize(THREAD);
+        if (HAS_PENDING_EXCEPTION) {
+          log_debug(compilation)("MDO checkpoint: eager init failed for %s", cname);
+          CLEAR_PENDING_EXCEPTION;
+          classes_init_failed++;
+        } else {
+          classes_initialized++;
+        }
+      }
     } else {
       log_debug(compilation)("MDO checkpoint: preload class failed for %s (loader=%d)",
                              cname, (int)cls.loader);
     }
   }
+  log_info(compilation)("MDO checkpoint: preloaded %d classes, initialized %d, init failed %d",
+                         classes_linked, classes_initialized, classes_init_failed);
 
   result.status = LoadStatus::Success;
   
