@@ -1,0 +1,15 @@
+# Windows build output — never send to Docker build context
+build/
+
+# IDE/editor noise
+.idea/
+*.iml
+.vscode/
+*.suo
+*.user
+
+# Git objects (large)
+.git/
+
+# Documentation build output
+doc/*.html

@@ -1,0 +1,80 @@
+# Multi-stage Dockerfile: builds JDK from source on Linux, produces a minimal runtime image.
+#
+# NOTE: This image uses glibc (Ubuntu), NOT musl (Alpine).
+# If your container was previously Alpine-based, switch it to ubuntu:24.04 or debian:bookworm-slim.
+# Mixing glibc binaries with a musl (Alpine) runtime will NOT work.
+#
+# Usage:
+#   docker build -f Dockerfile.linux-build -t jdk25-custom .
+#   docker run --rm jdk25-custom java -version
+
+# ---------------------------------------------------------------------------
+# Stage 1: Builder — eclipse-temurin:24-jdk is Ubuntu 24.04 (Noble) + Temurin 24
+# ---------------------------------------------------------------------------
+FROM eclipse-temurin:24-jdk AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        autoconf \
+        make \
+        gcc \
+        g++ \
+        libx11-dev \
+        libxext-dev \
+        libxrender-dev \
+        libxrandr-dev \
+        libxtst-dev \
+        libxt-dev \
+        libcups2-dev \
+        libfreetype6-dev \
+        libfontconfig1-dev \
+        libasound2-dev \
+        libffi-dev \
+        zip \
+        unzip \
+        file \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+
+# Copy source (respects .dockerignore — build/ and .git/ are excluded)
+COPY . .
+
+# Configure: headless build (no X11 at runtime), release mode.
+# ac_cv_build overrides config.guess which otherwise detects "x86_64-pc-wsl"
+# (Docker Desktop on Windows uses WSL2 as its backend, leaking the WSL kernel
+# version string into containers). Without this, configure tries to treat the
+# build as a Windows/WSL environment and fails looking for cygpath/wslpath.
+RUN ac_cv_build=x86_64-unknown-linux-gnu \
+    ac_cv_host=x86_64-unknown-linux-gnu \
+    bash configure \
+        --with-boot-jdk=$JAVA_HOME \
+        --with-debug-level=release \
+        --enable-headless-only \
+        --disable-warnings-as-errors \
+        --with-native-debug-symbols=none
+
+# Build just the JDK image (skips test JDK, src zips, etc.)
+RUN make jdk-image JOBS=$(nproc)
+
+# ---------------------------------------------------------------------------
+# Stage 2: Minimal runtime — Ubuntu 24.04 matches the builder's glibc
+# ---------------------------------------------------------------------------
+FROM ubuntu:24.04 AS runtime
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libfreetype6 \
+        fontconfig \
+        libasound2t64 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /src/build/linux-x86_64-server-release/images/jdk /opt/jdk
+
+ENV JAVA_HOME=/opt/jdk
+ENV PATH=$JAVA_HOME/bin:$PATH
+
+CMD ["java", "-version"]
