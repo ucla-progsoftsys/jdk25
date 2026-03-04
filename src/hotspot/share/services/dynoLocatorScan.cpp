@@ -1,6 +1,8 @@
 #include "services/dynoLocatorScan.hpp"
 
+#include "classfile/classLoaderDataGraph.hpp"
 #include "classfile/javaClasses.hpp"
+#include "classfile/systemDictionary.hpp"
 #include "classfile/vmClasses.hpp"
 #include "classfile/symbolTable.hpp"
 #include "ci/ciReplay.hpp"
@@ -187,40 +189,83 @@ class HiddenLocatorParser {
     return (int)v;
   }
 
+  // Search all class loaders for a class by name. Tries built-in loaders
+  // first, then walks ClassLoaderDataGraph for custom loaders.
+  InstanceKlass* resolve_klass_any_loader(Symbol* sym) {
+    // Try system loader (delegates to boot + platform via parent chain)
+    {
+      Handle sys_loader(_jt, SystemDictionary::java_system_loader());
+      Klass* k = SystemDictionary::resolve_or_null(sym, sys_loader, _jt);
+      if (_jt->has_pending_exception()) _jt->clear_pending_exception();
+      if (k != nullptr && k->is_instance_klass()) return InstanceKlass::cast(k);
+    }
+    // Search all loaded classes (covers custom loaders)
+    class FindByName : public KlassClosure {
+      Symbol* _name;
+    public:
+      InstanceKlass* _found;
+      FindByName(Symbol* name) : _name(name), _found(nullptr) {}
+      void do_klass(Klass* k) override {
+        if (_found != nullptr) return;
+        if (k != nullptr && k->is_instance_klass() && k->name() == _name) {
+          _found = InstanceKlass::cast(k);
+        }
+      }
+    } finder(sym);
+    ClassLoaderDataGraph::classes_do(&finder);
+    return finder._found;
+  }
+
   InstanceKlass* parse_bci() {
     char* klass = parse_token();
     char* mname = parse_token();
     char* msig  = parse_token();
     bool ok = true;
     int bci = parse_int(&ok);
-    if (!ok || klass == nullptr || mname == nullptr || msig == nullptr) return nullptr;
+    if (!ok || klass == nullptr || mname == nullptr || msig == nullptr) {
+      log_debug(compilation)("DynoLocator @bci: parse failed (null tokens or bad bci)");
+      return nullptr;
+    }
     Symbol* ksym = SymbolTable::new_symbol(klass);
     Symbol* mnsym = SymbolTable::new_symbol(mname);
     Symbol* mssym = SymbolTable::new_symbol(msig);
-    Handle loader(_jt, SystemDictionary::java_system_loader());
-    Klass* resolved_klass = SystemDictionary::resolve_or_fail(ksym, loader, true, _jt);
-    if (_jt->has_pending_exception()) { _jt->clear_pending_exception(); return nullptr; }
-    if (resolved_klass == nullptr || !resolved_klass->is_instance_klass()) {
+    InstanceKlass* ik = resolve_klass_any_loader(ksym);
+    if (ik == nullptr) {
+      log_info(compilation)("DynoLocator @bci: class resolve failed for %s", klass);
       return nullptr;
     }
-    InstanceKlass* ik = InstanceKlass::cast(resolved_klass);
-    ik->link_class(_jt);
-    if (_jt->has_pending_exception()) { _jt->clear_pending_exception(); return nullptr; }
+    ik->initialize(_jt);
+    if (_jt->has_pending_exception()) {
+      log_info(compilation)("DynoLocator @bci: class init failed for %s, trying link", klass);
+      _jt->clear_pending_exception();
+      ik->link_class(_jt);
+      if (_jt->has_pending_exception()) { _jt->clear_pending_exception(); return nullptr; }
+    }
     Method* m = ik->find_method(mnsym, mssym);
-    if (m == nullptr) return nullptr;
+    if (m == nullptr) {
+      log_info(compilation)("DynoLocator @bci: method not found %s.%s%s", klass, mname, msig);
+      return nullptr;
+    }
     methodHandle caller(_jt, m);
     if (m->validate_bci(bci) != bci) {
+      log_info(compilation)("DynoLocator @bci: invalid bci %d for %s.%s%s", bci, klass, mname, msig);
       return nullptr;
     }
     Bytecode_invoke bytecode = Bytecode_invoke_check(caller, bci);
-    if (!Bytecodes::is_defined(bytecode.code()) || !bytecode.is_valid()) return nullptr;
+    if (!Bytecodes::is_defined(bytecode.code()) || !bytecode.is_valid()) {
+      log_info(compilation)("DynoLocator @bci: invalid bytecode at bci %d for %s.%s%s", bci, klass, mname, msig);
+      return nullptr;
+    }
     bytecode.verify();
     int index = bytecode.index();
     const constantPoolHandle cp(_jt, ik->constants());
     CallInfo callInfo;
     Bytecodes::Code bc = bytecode.invoke_code();
     LinkResolver::resolve_invoke(callInfo, Handle(), cp, index, bc, _jt);
-    if (_jt->has_pending_exception()) { _jt->clear_pending_exception(); return nullptr; }
+    if (_jt->has_pending_exception()) {
+      log_info(compilation)("DynoLocator @bci: LinkResolver failed at bci %d for %s.%s%s", bci, klass, mname, msig);
+      _jt->clear_pending_exception(); return nullptr;
+    }
     oop appendix = nullptr;
     Method* adapter_method = nullptr;
     int pool_index = 0;
@@ -289,15 +334,18 @@ class HiddenLocatorParser {
     int cpi = parse_int(&ok);
     if (!ok || klass == nullptr) return nullptr;
     Symbol* ksym = SymbolTable::new_symbol(klass);
-    Handle loader(_jt, SystemDictionary::java_system_loader());
-    Klass* resolved_klass = SystemDictionary::resolve_or_fail(ksym, loader, true, _jt);
-    if (_jt->has_pending_exception()) { _jt->clear_pending_exception(); return nullptr; }
-    if (resolved_klass == nullptr || !resolved_klass->is_instance_klass()) {
+    InstanceKlass* ik = resolve_klass_any_loader(ksym);
+    if (ik == nullptr) {
+      log_info(compilation)("DynoLocator @cpi: class resolve failed for %s", klass);
       return nullptr;
     }
-    InstanceKlass* ik = InstanceKlass::cast(resolved_klass);
-    ik->link_class(_jt);
-    if (_jt->has_pending_exception()) { _jt->clear_pending_exception(); return nullptr; }
+    ik->initialize(_jt);
+    if (_jt->has_pending_exception()) {
+      log_info(compilation)("DynoLocator @cpi: class init failed for %s, trying link", klass);
+      _jt->clear_pending_exception();
+      ik->link_class(_jt);
+      if (_jt->has_pending_exception()) { _jt->clear_pending_exception(); return nullptr; }
+    }
     const constantPoolHandle cp(_jt, ik->constants());
     if (cpi >= cp->length() || !cp->tag_at(cpi).is_method_handle()) return nullptr;
     oop obj = cp->resolve_possibly_cached_constant_at(cpi, _jt);
@@ -618,7 +666,7 @@ void DynoLocatorScan::scan_all_classes() {
         Bytecodes::Code opcode = bcs.next();
         opcode = bcs.raw_code();
         if (opcode == Bytecodes::_invokedynamic || opcode == Bytecodes::_invokehandle) {
-          RecordLocation rl(loc_buf, "@bci %s %s %s %d",
+          RecordLocation rl(loc_buf, "@bci \"%s\" \"%s\" \"%s\" %d",
                            ik->name()->as_quoted_ascii(),
                            m->name()->as_quoted_ascii(),
                            m->signature()->as_quoted_ascii(),
@@ -636,7 +684,7 @@ void DynoLocatorScan::scan_all_classes() {
 
     // Scan constant pool MethodHandle entries (@cpi)
     {
-      RecordLocation rp(loc_buf, "@cpi %s", ik->name()->as_quoted_ascii());
+      RecordLocation rp(loc_buf, "@cpi \"%s\"", ik->name()->as_quoted_ascii());
       int len = cp->length();
       for (int i = 0; i < len; ++i) {
         if (cp->tag_at(i).is_method_handle()) {
