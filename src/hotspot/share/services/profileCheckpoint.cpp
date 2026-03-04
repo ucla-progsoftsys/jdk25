@@ -23,6 +23,7 @@
 #include "compiler/compileBroker.hpp"
 #include "compiler/compilerDefinitions.hpp"
 #include "memory/resourceArea.hpp"
+#include "utilities/resourceHash.hpp"
 #include "utilities/stringUtils.hpp"
 #include "interpreter/linkResolver.hpp"
 #include "oops/constantPool.inline.hpp"
@@ -575,14 +576,54 @@ static const char* get_klassname_utf8(InstanceKlass* ik) {
 // initialized later, try_install_pending() checks if any stashed records
 // match and installs them.
 
-static GrowableArray<ProfileCheckpoint::PendingRecord>* _pending_records = nullptr;
+using PendingRecordBuckets = GrowableArray<ProfileCheckpoint::PendingRecord>;
+
+static unsigned pending_key_hash(const char* const& key) {
+  if (key == nullptr) return 0;
+  unsigned h = 0;
+  for (const unsigned char* p = (const unsigned char*)key; *p != '\0'; p++) {
+    h = h * 31u + (unsigned)(*p);
+  }
+  return h;
+}
+
+static bool pending_key_equals(const char* const& a, const char* const& b) {
+  if (a == b) return true;
+  if (a == nullptr || b == nullptr) return false;
+  return strcmp(a, b) == 0;
+}
+
+using PendingRecordTable = ResourceHashtable<const char*, PendingRecordBuckets*, 2053,
+                                             AnyObj::C_HEAP, mtInternal,
+                                             pending_key_hash, pending_key_equals>;
+
+static PendingRecordTable* _pending_records = nullptr;
 static Mutex* _pending_records_lock = nullptr;
+static int _pending_record_count = 0;
 static volatile bool _has_pending = false;
+// Set when eager compiles are deferred due to uninitialized holders.
+static volatile bool _has_deferred_compiles = false;
+
+static char* make_pending_key(ProfileCheckpoint::LoaderId loader_id,
+                              const char* loader_name,
+                              const char* kname) {
+  char loader_id_buf[12];
+  ::snprintf(loader_id_buf, sizeof(loader_id_buf), "%d", (int)loader_id);
+  const char* lname = (loader_name != nullptr) ? loader_name : "";
+  const char* klass = (kname != nullptr) ? kname : "";
+  size_t key_len = strlen(loader_id_buf) + 1 + strlen(lname) + 1 + strlen(klass) + 1;
+  char* key = (char*)os::malloc(key_len, mtInternal);
+  if (key == nullptr) {
+    return nullptr;
+  }
+  ::snprintf(key, key_len, "%s|%s|%s", loader_id_buf, lname, klass);
+  return key;
+}
 
 static void init_pending_storage() {
   if (_pending_records == nullptr) {
     _pending_records_lock = new Mutex(Mutex::nosafepoint, "PendingMDORecords_lock");
-    _pending_records = new (mtInternal) GrowableArray<ProfileCheckpoint::PendingRecord>(64, mtInternal);
+    _pending_records = new (mtInternal) PendingRecordTable();
   }
 }
 
@@ -636,16 +677,32 @@ static void stash_pending_record(const ProfileCheckpoint::Record& rec,
   pr.mname       = strdup_or_null(mname);
   pr.msig        = strdup_or_null(msig);
   pr.loader_name = strdup_or_null(loader_name);
+
+  char* pending_key = make_pending_key(rec.key.loader, loader_name, kname);
+  if (pending_key == nullptr) {
+    free_pending_record(pr);
+    return;
+  }
+
   {
     MutexLocker ml(_pending_records_lock);
-    _pending_records->append(pr);
+    bool created = false;
+    PendingRecordBuckets** bucket = _pending_records->put_if_absent(pending_key, &created);
+    if (!created) {
+      os::free(pending_key);  // map already owns an equivalent key
+    }
+    if (*bucket == nullptr) {
+      *bucket = new (mtInternal) PendingRecordBuckets(4, mtInternal);
+    }
+    (*bucket)->append(pr);
+    _pending_record_count++;
+    _has_pending = true;
   }
-  _has_pending = true;
   log_debug(compilation)("MDO checkpoint: stashed pending record for %s::%s%s", kname, mname, msig);
 }
 
 bool ProfileCheckpoint::has_pending_records() {
-  return _has_pending;
+  return _has_pending || _has_deferred_compiles;
 }
 
 static InstanceKlass* resolve_klass_utf8(const char* name, ProfileCheckpoint::LoaderId loader_id, const char* loader_name, TRAPS) {
@@ -877,6 +934,158 @@ static bool copy_mdo_payload(MethodData* dst_mdo, const char* src_bytes, u4 src_
   return true;
 }
 
+// Entry for deferred eager compilation — collected during record install,
+// sorted by hotness, then compiled in priority order.
+struct EagerCompileEntry {
+  Method*  method;
+  u1       stored_level;
+  uint32_t hotness;  // invocation_count + backedge_count; higher = hotter
+};
+
+// Forward declaration for class-init deferred eager compile path.
+static void trigger_eager_compile(Method* target, u1 stored_level, JavaThread* thread);
+
+static GrowableArray<EagerCompileEntry>* _eager_compile_queue = nullptr;
+
+using DeferredCompileBuckets = GrowableArray<EagerCompileEntry>;
+using DeferredCompileTable = ResourceHashtable<InstanceKlass*, DeferredCompileBuckets*, 2053,
+                                               AnyObj::C_HEAP, mtInternal>;
+
+static DeferredCompileTable* _deferred_compiles = nullptr;
+static Mutex* _deferred_compiles_lock = nullptr;
+static int _deferred_compile_count = 0;
+
+static void init_deferred_compile_storage() {
+  if (_deferred_compiles == nullptr) {
+    _deferred_compiles_lock = new Mutex(Mutex::nosafepoint, "DeferredEagerCompiles_lock");
+    _deferred_compiles = new (mtInternal) DeferredCompileTable();
+  }
+}
+
+static void stash_deferred_eager_compile(const EagerCompileEntry& entry) {
+  Method* target = entry.method;
+  if (target == nullptr) return;
+  InstanceKlass* holder = target->method_holder();
+  if (holder == nullptr) return;
+
+  init_deferred_compile_storage();
+
+  MutexLocker ml(_deferred_compiles_lock);
+  bool created = false;
+  DeferredCompileBuckets** bucket = _deferred_compiles->put_if_absent(holder, &created);
+  if (created) {
+    log_debug(compilation)("MDO checkpoint: created deferred compile bucket for %s",
+                           holder->name()->as_utf8());
+  }
+  if (*bucket == nullptr) {
+    *bucket = new (mtInternal) DeferredCompileBuckets(4, mtInternal);
+  }
+
+  DeferredCompileBuckets* entries = *bucket;
+  for (int i = 0; i < entries->length(); i++) {
+    EagerCompileEntry& existing = entries->at(i);
+    if (existing.method == target) {
+      if (entry.hotness > existing.hotness) {
+        existing.hotness = entry.hotness;
+      }
+      if (entry.stored_level > existing.stored_level) {
+        existing.stored_level = entry.stored_level;
+      }
+      return;
+    }
+  }
+
+  entries->append(entry);
+  _deferred_compile_count++;
+  _has_deferred_compiles = true;
+}
+
+static void enqueue_eager_compile(Method* target, u1 stored_level) {
+  if (target == nullptr) return;
+  if (target->is_abstract() || target->is_native()) return;
+  uint32_t hotness = 0;
+  MethodCounters* mc = target->method_counters();
+  if (mc != nullptr) {
+    hotness = (uint32_t)mc->invocation_counter()->count()
+            + (uint32_t)mc->backedge_counter()->count();
+  }
+  if (_eager_compile_queue == nullptr) {
+    _eager_compile_queue = new (mtInternal) GrowableArray<EagerCompileEntry>(256, mtInternal);
+  }
+  EagerCompileEntry entry;
+  entry.method = target;
+  entry.stored_level = stored_level;
+  entry.hotness = hotness;
+  _eager_compile_queue->append(entry);
+}
+
+static int compare_eager_entries(EagerCompileEntry* a, EagerCompileEntry* b) {
+  // Sort by hotness descending (hottest methods first)
+  if (a->hotness > b->hotness) return -1;
+  if (a->hotness < b->hotness) return 1;
+  // Tie-break: higher stored comp_level first
+  if (a->stored_level > b->stored_level) return -1;
+  if (a->stored_level < b->stored_level) return 1;
+  return 0;
+}
+
+static void flush_eager_compile_queue(JavaThread* thread) {
+  if (_eager_compile_queue == nullptr || _eager_compile_queue->is_empty()) return;
+  if (!EagerCompileAfterLoad) return;
+  if (!UseCompiler || !CompilationPolicy::is_compilation_enabled()) return;
+
+  _eager_compile_queue->sort(compare_eager_entries);
+
+  int compiled = 0, deferred_init = 0, skipped_other = 0;
+  JavaThread* THREAD = thread;
+
+  for (int i = 0; i < _eager_compile_queue->length(); i++) {
+    EagerCompileEntry& e = _eager_compile_queue->at(i);
+    Method* target = e.method;
+
+    InstanceKlass* holder = target->method_holder();
+    if (!holder->is_initialized()) {
+      stash_deferred_eager_compile(e);
+      deferred_init++;
+      continue;
+    }
+
+    CompLevel level = (CompLevel)e.stored_level;
+    if (level < CompLevel_none) {
+      level = CompLevel_none;
+    } else if (level > CompLevel_full_optimization) {
+      level = CompLevel_full_optimization;
+    }
+    // Methods stored at level 0 (interpreter) had profile data but weren't
+    // compiled during the profiling run.  Upgrade to C1 full profile so the
+    // compiler can use the restored MDO data.  We intentionally do NOT upgrade
+    // level 3→4 (C2): flooding the C2 queue with all methods delays compilation
+    // of the truly hot ones, causing regressions (see section 22 in context.txt).
+    if (level <= CompLevel_none) {
+      level = CompLevel_full_profile;  // level 3 = C1 with full profiling
+      log_debug(compilation)("MDO checkpoint: upgraded level 0 -> 3 for %s::%s%s",
+                             holder->name()->as_utf8(),
+                             target->name()->as_utf8(), target->signature()->as_utf8());
+    }
+
+    methodHandle mh(THREAD, target);
+    log_debug(compilation)("Eager compiling %s %s %s at level %u (hotness=%u)",
+                           target->name()->as_utf8(), target->signature()->as_utf8(),
+                           holder->name()->as_utf8(), level, e.hotness);
+    CompileBroker::compile_method(mh, InvocationEntryBci, level, 0, CompileTask::Reason_MustBeCompiled, THREAD);
+    if (HAS_PENDING_EXCEPTION) { CLEAR_PENDING_EXCEPTION; }
+    compiled++;
+  }
+
+  log_info(compilation)("MDO checkpoint: eager compile queue flushed: %d compiled, %d deferred (holder not init), %d skipped (other)",
+                         compiled, deferred_init, skipped_other);
+
+  // Free the queue
+  delete _eager_compile_queue;
+  _eager_compile_queue = nullptr;
+}
+
+// Legacy entry point for deferred install paths (single method at a time)
 static void trigger_eager_compile(Method* target, u1 stored_level, JavaThread* thread) {
   if (!EagerCompileAfterLoad) return;
   if (target == nullptr || thread == nullptr) return;
@@ -889,9 +1098,9 @@ static void trigger_eager_compile(Method* target, u1 stored_level, JavaThread* t
   }
   InstanceKlass* holder = target->method_holder();
   if (!holder->is_initialized()) {
-    log_info(compilation)("MDO checkpoint: eager compile SKIPPED (holder not initialized) %s::%s%s",
-                          holder->name()->as_utf8(),
-                          target->name()->as_utf8(), target->signature()->as_utf8());
+    log_debug(compilation)("MDO checkpoint: eager compile SKIPPED (holder not initialized) %s::%s%s",
+                           holder->name()->as_utf8(),
+                           target->name()->as_utf8(), target->signature()->as_utf8());
     return;
   }
   CompLevel level = (CompLevel)stored_level;
@@ -900,20 +1109,59 @@ static void trigger_eager_compile(Method* target, u1 stored_level, JavaThread* t
   } else if (level > CompLevel_full_optimization) {
     level = CompLevel_full_optimization;
   }
-  // Methods stored at level 0 (interpreter) had profile data but weren't
-  // compiled during the profiling run.  Since we have their MDO, upgrade
-  // to C1-full-profile so the compiler can use the restored profile data.
+  // Upgrade level-0 methods to C1 full profile (same as the main queue path).
   if (level <= CompLevel_none) {
     level = CompLevel_full_profile;  // level 3 = C1 with full profiling
     log_debug(compilation)("MDO checkpoint: upgraded level 0 -> 3 for %s::%s%s",
-                           target->method_holder()->name()->as_utf8(),
+                           holder->name()->as_utf8(),
                            target->name()->as_utf8(), target->signature()->as_utf8());
   }
   JavaThread* THREAD = thread; // For exception macros.
   methodHandle mh(THREAD, target);
-  log_info(compilation)("Eager compiling %s %s %s at level %u", target->name()->as_utf8(), target->signature()->as_utf8(), target->method_holder()->name()->as_utf8(), level);
+  log_debug(compilation)("Eager compiling %s %s %s at level %u", target->name()->as_utf8(), target->signature()->as_utf8(), target->method_holder()->name()->as_utf8(), level);
   CompileBroker::compile_method(mh, InvocationEntryBci, level, 0, CompileTask::Reason_MustBeCompiled, THREAD);
   if (HAS_PENDING_EXCEPTION) { CLEAR_PENDING_EXCEPTION; }
+}
+
+static void trigger_deferred_eager_compiles_for_class(InstanceKlass* k, JavaThread* thread) {
+  if (!_has_deferred_compiles || _deferred_compiles == nullptr || k == nullptr || thread == nullptr) {
+    return;
+  }
+
+  DeferredCompileBuckets* entries = nullptr;
+  {
+    MutexLocker ml(_deferred_compiles_lock);
+    _deferred_compiles->remove(k, [&](InstanceKlass*& key, DeferredCompileBuckets*& value) {
+      (void)key;
+      entries = value;
+      if (value != nullptr) {
+        _deferred_compile_count -= value->length();
+      }
+    });
+    if (_deferred_compile_count <= 0) {
+      _deferred_compile_count = 0;
+      _has_deferred_compiles = false;
+    }
+  }
+
+  if (entries == nullptr || entries->is_empty()) {
+    if (entries != nullptr) {
+      delete entries;
+    }
+    return;
+  }
+
+  entries->sort(compare_eager_entries);
+  int submitted = 0;
+  for (int i = 0; i < entries->length(); i++) {
+    EagerCompileEntry& e = entries->at(i);
+    trigger_eager_compile(e.method, e.stored_level, thread);
+    submitted++;
+  }
+
+  log_info(compilation)("MDO checkpoint: deferred eager compile for %s: %d method(s) submitted",
+                        k->name()->as_utf8(), submitted);
+  delete entries;
 }
 
 static bool header_matches_current_vm(const ProfileCheckpoint::Header& hdr) {
@@ -1137,7 +1385,7 @@ bool ProfileCheckpoint::Loader::install_record(const Record& rec,
   }
 
   if (mdo_valid) {
-    trigger_eager_compile(target, rec.comp_level, THREAD);
+    enqueue_eager_compile(target, rec.comp_level);
   } else {
     log_debug(compilation)("MDO checkpoint: skipping eager compile for %s %s %s (invalid MDO)", kname, mname, msig);
   }
@@ -1297,8 +1545,8 @@ ProfileCheckpoint::Loader::LoadResult ProfileCheckpoint::Loader::load_from_file(
       }
     } else {
       classes_resolve_failed++;
-      log_info(compilation)("MDO checkpoint: resolve FAILED for %s (loader=%d, hidden=%s)",
-                            cname, (int)cls.loader, is_hidden_locator ? "yes" : "no");
+      log_debug(compilation)("MDO checkpoint: resolve FAILED for %s (loader=%d, hidden=%s)",
+                             cname, (int)cls.loader, is_hidden_locator ? "yes" : "no");
     }
   };
 
@@ -1374,10 +1622,18 @@ ProfileCheckpoint::Loader::LoadResult ProfileCheckpoint::Loader::load_from_file(
 
   fclose(f);
 
+  // Flush the eager compile queue — sorted by hotness (invocation+backedge count)
+  // so the hottest methods are submitted to the compiler first.
+  flush_eager_compile_queue(_thread);
+
   result.records_read = _records_read;
   result.records_installed = _records_installed;
   result.size_mismatch = _size_mismatch;
-  int pending_count = (_pending_records != nullptr) ? _pending_records->length() : 0;
+  int pending_count = 0;
+  if (_pending_records != nullptr && _pending_records_lock != nullptr) {
+    MutexLocker ml(_pending_records_lock);
+    pending_count = _pending_record_count;
+  }
   log_info(compilation)("MDO checkpoint: loaded %d records (%d installed, %d size mismatch, %d pending deferred)",
                          _records_read, _records_installed, _size_mismatch, pending_count);
   return result;
@@ -1388,146 +1644,144 @@ ProfileCheckpoint::Loader::LoadResult ProfileCheckpoint::Loader::load_from_file(
 // ============================================================================
 
 void ProfileCheckpoint::try_install_pending(InstanceKlass* k, JavaThread* thread) {
-  if (!_has_pending || _pending_records == nullptr || k == nullptr || thread == nullptr) return;
+  if ((!_has_pending && !_has_deferred_compiles) || k == nullptr || thread == nullptr) return;
 
   ResourceMark rm(thread);
   const char* kname = k->name()->as_utf8();
   if (kname == nullptr) return;
 
-  // Collect matching records under the lock, install outside the lock.
-  GrowableArray<int> matched_indices(4);
-  {
-    MutexLocker ml(_pending_records_lock);
-    for (int i = 0; i < _pending_records->length(); i++) {
-      PendingRecord& pr = _pending_records->at(i);
-      if (pr.kname != nullptr && strcmp(pr.kname, kname) == 0) {
-        matched_indices.append(i);
+  JavaThread* THREAD = thread;
+  int installed = 0;
+
+  // Pull this class's pending records in O(matches) via keyed lookup.
+  PendingRecordBuckets* bucket = nullptr;
+  if (_has_pending && _pending_records != nullptr) {
+    LoaderId loader_id = loader_id_from_klass(k);
+    const char* loader_name = (loader_id == LoaderId::NAMED) ? get_loader_name_for_klass(k) : nullptr;
+    char* pending_key = make_pending_key(loader_id, loader_name, kname);
+    if (pending_key != nullptr) {
+      {
+        MutexLocker ml(_pending_records_lock);
+        _pending_records->remove(pending_key, [&](const char*& key, PendingRecordBuckets*& value) {
+          bucket = value;
+          os::free((void*)key);
+          if (value != nullptr) {
+            _pending_record_count -= value->length();
+          }
+        });
+        if (_pending_record_count <= 0) {
+          _pending_record_count = 0;
+          _has_pending = false;
+        }
       }
+      os::free(pending_key);
     }
   }
 
-  if (matched_indices.is_empty()) return;
+  if (bucket != nullptr) {
+    for (int i = 0; i < bucket->length(); i++) {
+      PendingRecord& pr = bucket->at(i);
 
-  JavaThread* THREAD = thread;
-  int installed = 0;
-  // The caller (InstanceKlass::initialize_impl Step 9) has already set
-  // this class to fully_initialized, so no need to re-initialize here.
-
-  // Install matching records (iterate in reverse so removal doesn't shift indices)
-  for (int mi = matched_indices.length() - 1; mi >= 0; mi--) {
-    int idx = matched_indices.at(mi);
-    PendingRecord pr;
-    {
-      MutexLocker ml(_pending_records_lock);
-      if (idx >= _pending_records->length()) continue;
-      pr = _pending_records->at(idx);
-      // Remove from pending list by swapping with last element
-      _pending_records->at(idx) = _pending_records->at(_pending_records->length() - 1);
-      _pending_records->trunc_to(_pending_records->length() - 1);
-    }
-
-    Method* target = resolve_method_utf8(k, pr.mname, pr.msig);
-    if (target == nullptr) {
-      log_debug(compilation)("MDO checkpoint: deferred resolve method failed for %s::%s%s",
-                             pr.kname, pr.mname, pr.msig);
-      free_pending_record(pr);
-      continue;
-    }
-
-    if (target->method_data() == nullptr) {
-      methodHandle mh(THREAD, target);
-      target->build_profiling_method_data(mh, THREAD);
-      if (HAS_PENDING_EXCEPTION) { CLEAR_PENDING_EXCEPTION; }
-    }
-
-    MethodData* mdo = target->method_data();
-    if (mdo == nullptr) {
-      log_debug(compilation)("MDO checkpoint: deferred MDO build failed for %s::%s%s",
-                             pr.kname, pr.mname, pr.msig);
-      free_pending_record(pr);
-      continue;
-    }
-
-    bool mdo_valid = true;
-
-    if (!copy_mdo_payload(mdo, pr.mdo_bytes, pr.rec.mdo_size)) {
-      log_debug(compilation)("MDO checkpoint: deferred copy payload failed for %s::%s%s",
-                             pr.kname, pr.mname, pr.msig);
-      free_pending_record(pr);
-      continue;
-    }
-
-    if (pr.rec.key.bytecode_crc32 != 0) {
-      uint32_t current_crc = (uint32_t)ClassLoader::crc32(0, (const char*)target->code_base(), target->code_size());
-      if (current_crc != pr.rec.key.bytecode_crc32) {
-        log_debug(compilation)("MDO checkpoint: deferred CRC mismatch for %s::%s%s",
+      Method* target = resolve_method_utf8(k, pr.mname, pr.msig);
+      if (target == nullptr) {
+        log_debug(compilation)("MDO checkpoint: deferred resolve method failed for %s::%s%s",
                                pr.kname, pr.mname, pr.msig);
-        mdo_valid = false;
+        free_pending_record(pr);
+        continue;
       }
-    }
 
-    if (pr.header_bytes != nullptr && mdo_valid) {
-      if (pr.rec.header_size == sizeof(MethodData::HeaderSnapshot)) {
-        MethodData::HeaderSnapshot snapshot;
-        Copy::conjoint_jbytes(pr.header_bytes, (char*)&snapshot, pr.rec.header_size);
-        if (!mdo->restore_header(snapshot)) {
-          mdo_valid = false;
-        }
-      } else {
-        mdo_valid = false;
-      }
-    }
-
-    if (mdo_valid) {
-      mdo_valid = validate_mdo_bcis(mdo, target);
-    }
-
-    sanitize_type_entries(mdo);
-
-    // Restore MethodCounters
-    if (pr.rec.mc_size > 0) {
-      MethodCounters* mc = target->method_counters();
-      if (mc == nullptr) {
+      if (target->method_data() == nullptr) {
         methodHandle mh(THREAD, target);
-        mc = Method::build_method_counters(THREAD, target);
+        target->build_profiling_method_data(mh, THREAD);
         if (HAS_PENDING_EXCEPTION) { CLEAR_PENDING_EXCEPTION; }
       }
-      if (mc != nullptr) {
-        const size_t ic_sz = sizeof(InvocationCounter);
-        if (pr.rec.mc_size >= ic_sz * 2 + sizeof(jlong) + sizeof(float) + sizeof(jint)) {
-          char* p = pr.mc_bytes;
-          Copy::conjoint_jbytes(p, (char*)mc->invocation_counter(), (jlong)ic_sz); p += ic_sz;
-          Copy::conjoint_jbytes(p, (char*)mc->backedge_counter(), (jlong)ic_sz); p += ic_sz;
-          jlong prev_time = *(jlong*)p; p += sizeof(jlong);
-          mc->set_prev_time(prev_time);
-          float rate = *(float*)p; p += sizeof(float);
-          mc->set_rate(rate);
-          jint pec = *(jint*)p; p += sizeof(jint);
-          mc->set_prev_event_count(pec);
+
+      MethodData* mdo = target->method_data();
+      if (mdo == nullptr) {
+        log_debug(compilation)("MDO checkpoint: deferred MDO build failed for %s::%s%s",
+                               pr.kname, pr.mname, pr.msig);
+        free_pending_record(pr);
+        continue;
+      }
+
+      bool mdo_valid = true;
+
+      if (!copy_mdo_payload(mdo, pr.mdo_bytes, pr.rec.mdo_size)) {
+        log_debug(compilation)("MDO checkpoint: deferred copy payload failed for %s::%s%s",
+                               pr.kname, pr.mname, pr.msig);
+        free_pending_record(pr);
+        continue;
+      }
+
+      if (pr.rec.key.bytecode_crc32 != 0) {
+        uint32_t current_crc = (uint32_t)ClassLoader::crc32(0, (const char*)target->code_base(), target->code_size());
+        if (current_crc != pr.rec.key.bytecode_crc32) {
+          log_debug(compilation)("MDO checkpoint: deferred CRC mismatch for %s::%s%s",
+                                 pr.kname, pr.mname, pr.msig);
+          mdo_valid = false;
         }
       }
+
+      if (pr.header_bytes != nullptr && mdo_valid) {
+        if (pr.rec.header_size == sizeof(MethodData::HeaderSnapshot)) {
+          MethodData::HeaderSnapshot snapshot;
+          Copy::conjoint_jbytes(pr.header_bytes, (char*)&snapshot, pr.rec.header_size);
+          if (!mdo->restore_header(snapshot)) {
+            mdo_valid = false;
+          }
+        } else {
+          mdo_valid = false;
+        }
+      }
+
+      if (mdo_valid) {
+        mdo_valid = validate_mdo_bcis(mdo, target);
+      }
+
+      sanitize_type_entries(mdo);
+
+      // Restore MethodCounters
+      if (pr.rec.mc_size > 0) {
+        MethodCounters* mc = target->method_counters();
+        if (mc == nullptr) {
+          methodHandle mh(THREAD, target);
+          mc = Method::build_method_counters(THREAD, target);
+          if (HAS_PENDING_EXCEPTION) { CLEAR_PENDING_EXCEPTION; }
+        }
+        if (mc != nullptr) {
+          const size_t ic_sz = sizeof(InvocationCounter);
+          if (pr.rec.mc_size >= ic_sz * 2 + sizeof(jlong) + sizeof(float) + sizeof(jint)) {
+            char* p = pr.mc_bytes;
+            Copy::conjoint_jbytes(p, (char*)mc->invocation_counter(), (jlong)ic_sz); p += ic_sz;
+            Copy::conjoint_jbytes(p, (char*)mc->backedge_counter(), (jlong)ic_sz); p += ic_sz;
+            jlong prev_time = *(jlong*)p; p += sizeof(jlong);
+            mc->set_prev_time(prev_time);
+            float rate = *(float*)p; p += sizeof(float);
+            mc->set_rate(rate);
+            jint pec = *(jint*)p; p += sizeof(jint);
+            mc->set_prev_event_count(pec);
+          }
+        }
+      }
+
+      if (mdo_valid) {
+        trigger_eager_compile(target, pr.rec.comp_level, thread);
+        installed++;
+      }
+
+      free_pending_record(pr);
     }
 
-    if (mdo_valid) {
-      trigger_eager_compile(target, pr.rec.comp_level, thread);
-      installed++;
-    }
-
-    free_pending_record(pr);
+    delete bucket;
   }
 
   if (installed > 0) {
     log_info(compilation)("MDO checkpoint: deferred install for %s: %d method(s) installed",
-                           kname, installed);
+                          kname, installed);
   }
 
-  // Update the flag
-  {
-    MutexLocker ml(_pending_records_lock);
-    if (_pending_records->is_empty()) {
-      _has_pending = false;
-    }
-  }
+  // Also submit eager compiles that were deferred earlier due to holder not initialized.
+  trigger_deferred_eager_compiles_for_class(k, thread);
 }
 
 // ============================================================================
