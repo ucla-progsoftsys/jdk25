@@ -190,6 +190,7 @@ static bool write_record(fileStream* out, const ProfileCheckpoint::Record& r, co
   // MDOX: write loader_name_id after loader
   u4 loader_name_id = (r.key.loader == ProfileCheckpoint::LoaderId::NAMED) ? r.key.loader_name.id : NO_LOADER_NAME;
   if (!write_u4(out, loader_name_id)) return false;
+  if (!write_u4(out, r.key.bytecode_crc32)) return false;
   if (!write_exact(out, &r.comp_level, sizeof(r.comp_level))) return false;
   if (!write_u4(out, r.mdo_size)) return false;
   if (!write_u4(out, r.fixup_count)) return false;
@@ -224,6 +225,7 @@ static bool read_record(FILE* in, ProfileCheckpoint::Record& r, ProfileCheckpoin
   r.key.loader = (ProfileCheckpoint::LoaderId)loader;
   r.key.loader_name.id = NO_LOADER_NAME;
   if (!read_u4(in, r.key.loader_name.id)) return false;
+  if (!read_u4(in, r.key.bytecode_crc32)) return false;
   if (!read_exact(in, &r.comp_level, sizeof(r.comp_level))) return false;
   if (!read_u4(in, r.mdo_size)) return false;
   if (!read_u4(in, r.fixup_count)) return false;
