@@ -877,6 +877,104 @@ static bool copy_mdo_payload(MethodData* dst_mdo, const char* src_bytes, u4 src_
   return true;
 }
 
+// Entry for deferred eager compilation — collected during record install,
+// sorted by hotness, then compiled in priority order.
+struct EagerCompileEntry {
+  Method*  method;
+  u1       stored_level;
+  uint32_t hotness;  // invocation_count + backedge_count; higher = hotter
+};
+
+static GrowableArray<EagerCompileEntry>* _eager_compile_queue = nullptr;
+
+static void enqueue_eager_compile(Method* target, u1 stored_level) {
+  if (target == nullptr) return;
+  if (target->is_abstract() || target->is_native()) return;
+  uint32_t hotness = 0;
+  MethodCounters* mc = target->method_counters();
+  if (mc != nullptr) {
+    hotness = (uint32_t)mc->invocation_counter()->count()
+            + (uint32_t)mc->backedge_counter()->count();
+  }
+  if (_eager_compile_queue == nullptr) {
+    _eager_compile_queue = new (mtInternal) GrowableArray<EagerCompileEntry>(256, mtInternal);
+  }
+  EagerCompileEntry entry;
+  entry.method = target;
+  entry.stored_level = stored_level;
+  entry.hotness = hotness;
+  _eager_compile_queue->append(entry);
+}
+
+static int compare_eager_entries(EagerCompileEntry* a, EagerCompileEntry* b) {
+  // Sort by hotness descending (hottest methods first)
+  if (a->hotness > b->hotness) return -1;
+  if (a->hotness < b->hotness) return 1;
+  // Tie-break: higher stored comp_level first
+  if (a->stored_level > b->stored_level) return -1;
+  if (a->stored_level < b->stored_level) return 1;
+  return 0;
+}
+
+static void flush_eager_compile_queue(JavaThread* thread) {
+  if (_eager_compile_queue == nullptr || _eager_compile_queue->is_empty()) return;
+  if (!EagerCompileAfterLoad) return;
+  if (!UseCompiler || !CompilationPolicy::is_compilation_enabled()) return;
+
+  _eager_compile_queue->sort(compare_eager_entries);
+
+  int compiled = 0, skipped_init = 0, skipped_other = 0;
+  JavaThread* THREAD = thread;
+
+  for (int i = 0; i < _eager_compile_queue->length(); i++) {
+    EagerCompileEntry& e = _eager_compile_queue->at(i);
+    Method* target = e.method;
+
+    InstanceKlass* holder = target->method_holder();
+    if (!holder->is_initialized()) {
+      log_info(compilation)("MDO checkpoint: eager compile SKIPPED (holder not initialized) %s::%s%s",
+                            holder->name()->as_utf8(),
+                            target->name()->as_utf8(), target->signature()->as_utf8());
+      skipped_init++;
+      continue;
+    }
+
+    CompLevel level = (CompLevel)e.stored_level;
+    if (level < CompLevel_none) {
+      level = CompLevel_none;
+    } else if (level > CompLevel_full_optimization) {
+      level = CompLevel_full_optimization;
+    }
+    // Methods stored at level 0 (interpreter) had profile data but weren't
+    // compiled during the profiling run.  Upgrade to C1 full profile so the
+    // compiler can use the restored MDO data.  We intentionally do NOT upgrade
+    // level 3→4 (C2): flooding the C2 queue with all methods delays compilation
+    // of the truly hot ones, causing regressions (see section 22 in context.txt).
+    if (level <= CompLevel_none) {
+      level = CompLevel_full_profile;  // level 3 = C1 with full profiling
+      log_debug(compilation)("MDO checkpoint: upgraded level 0 -> 3 for %s::%s%s",
+                             holder->name()->as_utf8(),
+                             target->name()->as_utf8(), target->signature()->as_utf8());
+    }
+
+    methodHandle mh(THREAD, target);
+    log_info(compilation)("Eager compiling %s %s %s at level %u (hotness=%u)",
+                          target->name()->as_utf8(), target->signature()->as_utf8(),
+                          holder->name()->as_utf8(), level, e.hotness);
+    CompileBroker::compile_method(mh, InvocationEntryBci, level, 0, CompileTask::Reason_MustBeCompiled, THREAD);
+    if (HAS_PENDING_EXCEPTION) { CLEAR_PENDING_EXCEPTION; }
+    compiled++;
+  }
+
+  log_info(compilation)("MDO checkpoint: eager compile queue flushed: %d compiled, %d skipped (holder not init), %d skipped (other)",
+                         compiled, skipped_init, skipped_other);
+
+  // Free the queue
+  delete _eager_compile_queue;
+  _eager_compile_queue = nullptr;
+}
+
+// Legacy entry point for deferred install paths (single method at a time)
 static void trigger_eager_compile(Method* target, u1 stored_level, JavaThread* thread) {
   if (!EagerCompileAfterLoad) return;
   if (target == nullptr || thread == nullptr) return;
@@ -900,13 +998,11 @@ static void trigger_eager_compile(Method* target, u1 stored_level, JavaThread* t
   } else if (level > CompLevel_full_optimization) {
     level = CompLevel_full_optimization;
   }
-  // Methods stored at level 0 (interpreter) had profile data but weren't
-  // compiled during the profiling run.  Since we have their MDO, upgrade
-  // to C1-full-profile so the compiler can use the restored profile data.
+  // Upgrade level-0 methods to C1 full profile (same as the main queue path).
   if (level <= CompLevel_none) {
     level = CompLevel_full_profile;  // level 3 = C1 with full profiling
     log_debug(compilation)("MDO checkpoint: upgraded level 0 -> 3 for %s::%s%s",
-                           target->method_holder()->name()->as_utf8(),
+                           holder->name()->as_utf8(),
                            target->name()->as_utf8(), target->signature()->as_utf8());
   }
   JavaThread* THREAD = thread; // For exception macros.
@@ -1137,7 +1233,7 @@ bool ProfileCheckpoint::Loader::install_record(const Record& rec,
   }
 
   if (mdo_valid) {
-    trigger_eager_compile(target, rec.comp_level, THREAD);
+    enqueue_eager_compile(target, rec.comp_level);
   } else {
     log_debug(compilation)("MDO checkpoint: skipping eager compile for %s %s %s (invalid MDO)", kname, mname, msig);
   }
@@ -1373,6 +1469,10 @@ ProfileCheckpoint::Loader::LoadResult ProfileCheckpoint::Loader::load_from_file(
   }
 
   fclose(f);
+
+  // Flush the eager compile queue — sorted by hotness (invocation+backedge count)
+  // so the hottest methods are submitted to the compiler first.
+  flush_eager_compile_queue(_thread);
 
   result.records_read = _records_read;
   result.records_installed = _records_installed;
