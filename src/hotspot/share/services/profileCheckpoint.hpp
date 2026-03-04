@@ -162,10 +162,29 @@ public:
                         GrowableArray<char*>& symtab);
   };
 
+  // Deferred MDO install: records whose holder class couldn't be resolved
+  // at load time (typically named-loader classes not yet loaded).
+  struct PendingRecord {
+    Record    rec;
+    Fixup*    fixups;       // owned, may be nullptr
+    char*     mdo_bytes;    // owned
+    char*     mc_bytes;     // owned, may be nullptr
+    char*     header_bytes; // owned, may be nullptr
+    char*     kname;        // os::malloc'd copy of class name
+    char*     mname;        // os::malloc'd copy of method name
+    char*     msig;         // os::malloc'd copy of method signature
+    char*     loader_name;  // os::malloc'd copy of loader name, may be nullptr
+  };
+
   static void load(class JavaThread* THREAD);
   static void dump_to_stream(class fileStream* out);
   static void wait_for_compile_completion(class JavaThread* THREAD);
   static void scan_hidden_class_locators();
+
+  // Called from InstanceKlass::initialize_impl() to install deferred MDO records
+  // for classes whose classloader wasn't available at checkpoint load time.
+  static void try_install_pending(class InstanceKlass* k, class JavaThread* thread);
+  static bool has_pending_records();
 };
 
 #endif // SHARE_SERVICES_PROFILECHECKPOINT_HPP

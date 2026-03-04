@@ -452,12 +452,12 @@ static void normalize_class_pattern(const char* raw, char* normalized) {
   normalized[i] = '\0';
 }
 
-static void build_eager_init_allowlist(GrowableArray<const char*>& patterns) {
-  if (EagerInitAfterLoadAllowlist == nullptr || EagerInitAfterLoadAllowlist[0] == '\0') {
+static void build_pattern_list(const char* csv, GrowableArray<const char*>& patterns) {
+  if (csv == nullptr || csv[0] == '\0') {
     return;
   }
 
-  StringUtils::CommaSeparatedStringIterator iter(EagerInitAfterLoadAllowlist);
+  StringUtils::CommaSeparatedStringIterator iter(csv);
   for (; *iter != nullptr; ++iter) {
     const char* token = *iter;
     if (token[0] == '\0') {
@@ -470,8 +470,16 @@ static void build_eager_init_allowlist(GrowableArray<const char*>& patterns) {
   }
 }
 
-static bool class_matches_eager_init_allowlist(const char* klass_name,
-                                               const GrowableArray<const char*>& patterns) {
+static void build_eager_init_allowlist(GrowableArray<const char*>& patterns) {
+  build_pattern_list(EagerInitAfterLoadAllowlist, patterns);
+}
+
+static void build_eager_init_denylist(GrowableArray<const char*>& patterns) {
+  build_pattern_list(EagerInitAfterLoadDenylist, patterns);
+}
+
+static bool class_matches_patterns(const char* klass_name,
+                                   const GrowableArray<const char*>& patterns) {
   if (klass_name == nullptr || klass_name[0] == '\0' || klass_name[0] == '@') {
     return false;
   }
@@ -481,6 +489,18 @@ static bool class_matches_eager_init_allowlist(const char* klass_name,
     }
   }
   return false;
+}
+
+static bool class_matches_eager_init_allowlist(const char* klass_name,
+                                               const GrowableArray<const char*>& allowlist,
+                                               const GrowableArray<const char*>& denylist) {
+  if (!class_matches_patterns(klass_name, allowlist)) {
+    return false;
+  }
+  if (class_matches_patterns(klass_name, denylist)) {
+    return false;
+  }
+  return true;
 }
 
 static void log_and_clear_pending_exception(const char* action,
@@ -545,6 +565,87 @@ static const char* get_klassname_utf8(InstanceKlass* ik) {
     log_debug(compilation)("hidden ik encountered without locator: %s", ik->name()->as_utf8());
   }
   return ik->name()->as_utf8();
+}
+
+// ============================================================================
+// Deferred MDO install for named-loader classes
+// ============================================================================
+// Records whose holder class couldn't be resolved at load time (because the
+// classloader hadn't been created yet) are stashed here.  When a class is
+// initialized later, try_install_pending() checks if any stashed records
+// match and installs them.
+
+static GrowableArray<ProfileCheckpoint::PendingRecord>* _pending_records = nullptr;
+static Mutex* _pending_records_lock = nullptr;
+static volatile bool _has_pending = false;
+
+static void init_pending_storage() {
+  if (_pending_records == nullptr) {
+    _pending_records_lock = new Mutex(Mutex::nosafepoint, "PendingMDORecords_lock");
+    _pending_records = new (mtInternal) GrowableArray<ProfileCheckpoint::PendingRecord>(64, mtInternal);
+  }
+}
+
+static char* strdup_or_null(const char* s) {
+  if (s == nullptr) return nullptr;
+  size_t len = strlen(s) + 1;
+  char* copy = (char*)os::malloc(len, mtInternal);
+  if (copy) memcpy(copy, s, len);
+  return copy;
+}
+
+static void free_pending_record(ProfileCheckpoint::PendingRecord& pr) {
+  if (pr.fixups)       os::free(pr.fixups);
+  if (pr.mdo_bytes)    os::free(pr.mdo_bytes);
+  if (pr.mc_bytes)     os::free(pr.mc_bytes);
+  if (pr.header_bytes) os::free(pr.header_bytes);
+  if (pr.kname)        os::free(pr.kname);
+  if (pr.mname)        os::free(pr.mname);
+  if (pr.msig)         os::free(pr.msig);
+  if (pr.loader_name)  os::free(pr.loader_name);
+}
+
+static char* memdup_or_null(const char* src, size_t size) {
+  if (src == nullptr || size == 0) return nullptr;
+  char* copy = (char*)os::malloc(size, mtInternal);
+  if (copy) memcpy(copy, src, size);
+  return copy;
+}
+
+static void stash_pending_record(const ProfileCheckpoint::Record& rec,
+                                 const ProfileCheckpoint::Fixup* fixups,
+                                 const char* mdo_bytes, const char* mc_bytes,
+                                 const char* header_bytes,
+                                 const char* kname, const char* mname,
+                                 const char* msig, const char* loader_name) {
+  init_pending_storage();
+  ProfileCheckpoint::PendingRecord pr;
+  pr.rec = rec;
+  // Deep-copy all heap buffers so the caller can still free its originals
+  pr.fixups = nullptr;
+  if (fixups != nullptr && rec.fixup_count > 0) {
+    size_t fx_size = sizeof(ProfileCheckpoint::Fixup) * rec.fixup_count;
+    pr.fixups = (ProfileCheckpoint::Fixup*)os::malloc(fx_size, mtInternal);
+    if (pr.fixups) memcpy(pr.fixups, fixups, fx_size);
+  }
+  pr.mdo_bytes    = memdup_or_null(mdo_bytes, rec.mdo_size);
+  pr.mc_bytes     = memdup_or_null(mc_bytes, rec.mc_size);
+  pr.header_bytes = memdup_or_null(header_bytes, rec.header_size);
+  // Copy the symtab strings (they come from the ResourceMark-scoped symtab)
+  pr.kname       = strdup_or_null(kname);
+  pr.mname       = strdup_or_null(mname);
+  pr.msig        = strdup_or_null(msig);
+  pr.loader_name = strdup_or_null(loader_name);
+  {
+    MutexLocker ml(_pending_records_lock);
+    _pending_records->append(pr);
+  }
+  _has_pending = true;
+  log_debug(compilation)("MDO checkpoint: stashed pending record for %s::%s%s", kname, mname, msig);
+}
+
+bool ProfileCheckpoint::has_pending_records() {
+  return _has_pending;
 }
 
 static InstanceKlass* resolve_klass_utf8(const char* name, ProfileCheckpoint::LoaderId loader_id, const char* loader_name, TRAPS) {
@@ -799,6 +900,15 @@ static void trigger_eager_compile(Method* target, u1 stored_level, JavaThread* t
   } else if (level > CompLevel_full_optimization) {
     level = CompLevel_full_optimization;
   }
+  // Methods stored at level 0 (interpreter) had profile data but weren't
+  // compiled during the profiling run.  Since we have their MDO, upgrade
+  // to C1-full-profile so the compiler can use the restored profile data.
+  if (level <= CompLevel_none) {
+    level = CompLevel_full_profile;  // level 3 = C1 with full profiling
+    log_debug(compilation)("MDO checkpoint: upgraded level 0 -> 3 for %s::%s%s",
+                           target->method_holder()->name()->as_utf8(),
+                           target->name()->as_utf8(), target->signature()->as_utf8());
+  }
   JavaThread* THREAD = thread; // For exception macros.
   methodHandle mh(THREAD, target);
   log_info(compilation)("Eager compiling %s %s %s at level %u", target->name()->as_utf8(), target->signature()->as_utf8(), target->method_holder()->name()->as_utf8(), level);
@@ -927,6 +1037,13 @@ bool ProfileCheckpoint::Loader::install_record(const Record& rec,
 
   InstanceKlass* holder = resolve_klass_utf8(kname, rec.key.loader, loader_name, THREAD);
   if (holder == nullptr) {
+    // For named-loader classes, the classloader may not exist yet.
+    // Stash a copy of the record for deferred install when the class loads later.
+    if (rec.key.loader == LoaderId::NAMED) {
+      stash_pending_record(rec, fixups, mdo_bytes, mc_bytes, header_bytes,
+                           kname, mname, msig, loader_name);
+      return false; // still "not installed" — caller frees originals, pending has copies
+    }
     log_debug(compilation)("MDO checkpoint: resolve class failed for %s", kname);
     return false;
   }
@@ -1096,14 +1213,17 @@ ProfileCheckpoint::Loader::LoadResult ProfileCheckpoint::Loader::load_from_file(
   JavaThread* THREAD = _thread; // For exception macros.
 
   GrowableArray<const char*> eager_init_allowlist(8);
+  GrowableArray<const char*> eager_init_denylist(8);
   build_eager_init_allowlist(eager_init_allowlist);
+  build_eager_init_denylist(eager_init_denylist);
   const bool eager_init_enabled = EagerInitAfterLoad && eager_init_allowlist.length() > 0;
   if (EagerInitAfterLoad && !eager_init_enabled) {
     log_warning(compilation)("MDO checkpoint: EagerInitAfterLoad is enabled but "
                              "EagerInitAfterLoadAllowlist is empty; using link-only preload");
   } else if (eager_init_enabled) {
-    log_info(compilation)("MDO checkpoint: EagerInitAfterLoad enabled with %d allowlist pattern(s)",
-                          eager_init_allowlist.length());
+    log_info(compilation)("MDO checkpoint: EagerInitAfterLoad enabled with %d allowlist pattern(s), "
+                          "%d denylist pattern(s)",
+                          eager_init_allowlist.length(), eager_init_denylist.length());
   }
 
   // Two-pass class preload:
@@ -1117,6 +1237,7 @@ ProfileCheckpoint::Loader::LoadResult ProfileCheckpoint::Loader::load_from_file(
   int classes_initialized = 0;
   int classes_init_failed = 0;
   int classes_init_skipped = 0;
+  int classes_init_denied = 0;
   int classes_resolve_failed = 0;
   int classes_hidden = 0;
   int classes_hidden_resolved = 0;
@@ -1141,7 +1262,8 @@ ProfileCheckpoint::Loader::LoadResult ProfileCheckpoint::Loader::load_from_file(
       classes_resolved++;
       if (is_hidden_locator) classes_hidden_resolved++;
       const bool can_eager_init = is_builtin_loader(cls.loader) &&
-                                  class_matches_eager_init_allowlist(cname, eager_init_allowlist);
+                                  class_matches_eager_init_allowlist(cname, eager_init_allowlist,
+                                                                     eager_init_denylist);
       if (eager_init_enabled && can_eager_init) {
         classes_init_attempted++;
         if (try_initialize_class(holder, cname, cls.loader, "preload initialize", THREAD)) {
@@ -1156,7 +1278,12 @@ ProfileCheckpoint::Loader::LoadResult ProfileCheckpoint::Loader::load_from_file(
         }
       } else {
         if (is_builtin_loader(cls.loader)) {
-          classes_init_skipped++;
+          if (eager_init_enabled && class_matches_patterns(cname, eager_init_denylist)) {
+            classes_init_denied++;
+            log_debug(compilation)("MDO checkpoint: init DENIED (denylist) for %s", cname);
+          } else {
+            classes_init_skipped++;
+          }
         }
         if (try_link_class(holder, cname, cls.loader, "preload link", THREAD)) {
           classes_linked_only++;
@@ -1198,11 +1325,12 @@ ProfileCheckpoint::Loader::LoadResult ProfileCheckpoint::Loader::load_from_file(
 
   log_info(compilation)("MDO checkpoint: class preload summary: total=%d resolved=%d "
                          "init_attempted=%d initialized=%d init_failed=%d init_skipped=%d "
-                         "linked_only=%d link_failed=%d resolve_failed=%d hidden=%d hidden_resolved=%d",
+                         "init_denied=%d linked_only=%d link_failed=%d resolve_failed=%d "
+                         "hidden=%d hidden_resolved=%d",
                          classes_total, classes_resolved,
                          classes_init_attempted, classes_initialized,
                          classes_init_failed, classes_init_skipped,
-                         classes_linked_only, classes_link_failed,
+                         classes_init_denied, classes_linked_only, classes_link_failed,
                          classes_resolve_failed, classes_hidden, classes_hidden_resolved);
 
   result.status = LoadStatus::Success;
@@ -1249,9 +1377,157 @@ ProfileCheckpoint::Loader::LoadResult ProfileCheckpoint::Loader::load_from_file(
   result.records_read = _records_read;
   result.records_installed = _records_installed;
   result.size_mismatch = _size_mismatch;
-  log_info(compilation)("MDO checkpoint: loaded %d records (%d installed, %d size mismatch)",
-                         _records_read, _records_installed, _size_mismatch);
+  int pending_count = (_pending_records != nullptr) ? _pending_records->length() : 0;
+  log_info(compilation)("MDO checkpoint: loaded %d records (%d installed, %d size mismatch, %d pending deferred)",
+                         _records_read, _records_installed, _size_mismatch, pending_count);
   return result;
+}
+
+// ============================================================================
+// Deferred MDO install — called from InstanceKlass::initialize_impl()
+// ============================================================================
+
+void ProfileCheckpoint::try_install_pending(InstanceKlass* k, JavaThread* thread) {
+  if (!_has_pending || _pending_records == nullptr || k == nullptr || thread == nullptr) return;
+
+  ResourceMark rm(thread);
+  const char* kname = k->name()->as_utf8();
+  if (kname == nullptr) return;
+
+  // Collect matching records under the lock, install outside the lock.
+  GrowableArray<int> matched_indices(4);
+  {
+    MutexLocker ml(_pending_records_lock);
+    for (int i = 0; i < _pending_records->length(); i++) {
+      PendingRecord& pr = _pending_records->at(i);
+      if (pr.kname != nullptr && strcmp(pr.kname, kname) == 0) {
+        matched_indices.append(i);
+      }
+    }
+  }
+
+  if (matched_indices.is_empty()) return;
+
+  JavaThread* THREAD = thread;
+  int installed = 0;
+  // The caller (InstanceKlass::initialize_impl Step 9) has already set
+  // this class to fully_initialized, so no need to re-initialize here.
+
+  // Install matching records (iterate in reverse so removal doesn't shift indices)
+  for (int mi = matched_indices.length() - 1; mi >= 0; mi--) {
+    int idx = matched_indices.at(mi);
+    PendingRecord pr;
+    {
+      MutexLocker ml(_pending_records_lock);
+      if (idx >= _pending_records->length()) continue;
+      pr = _pending_records->at(idx);
+      // Remove from pending list by swapping with last element
+      _pending_records->at(idx) = _pending_records->at(_pending_records->length() - 1);
+      _pending_records->trunc_to(_pending_records->length() - 1);
+    }
+
+    Method* target = resolve_method_utf8(k, pr.mname, pr.msig);
+    if (target == nullptr) {
+      log_debug(compilation)("MDO checkpoint: deferred resolve method failed for %s::%s%s",
+                             pr.kname, pr.mname, pr.msig);
+      free_pending_record(pr);
+      continue;
+    }
+
+    if (target->method_data() == nullptr) {
+      methodHandle mh(THREAD, target);
+      target->build_profiling_method_data(mh, THREAD);
+      if (HAS_PENDING_EXCEPTION) { CLEAR_PENDING_EXCEPTION; }
+    }
+
+    MethodData* mdo = target->method_data();
+    if (mdo == nullptr) {
+      log_debug(compilation)("MDO checkpoint: deferred MDO build failed for %s::%s%s",
+                             pr.kname, pr.mname, pr.msig);
+      free_pending_record(pr);
+      continue;
+    }
+
+    bool mdo_valid = true;
+
+    if (!copy_mdo_payload(mdo, pr.mdo_bytes, pr.rec.mdo_size)) {
+      log_debug(compilation)("MDO checkpoint: deferred copy payload failed for %s::%s%s",
+                             pr.kname, pr.mname, pr.msig);
+      free_pending_record(pr);
+      continue;
+    }
+
+    if (pr.rec.key.bytecode_crc32 != 0) {
+      uint32_t current_crc = (uint32_t)ClassLoader::crc32(0, (const char*)target->code_base(), target->code_size());
+      if (current_crc != pr.rec.key.bytecode_crc32) {
+        log_debug(compilation)("MDO checkpoint: deferred CRC mismatch for %s::%s%s",
+                               pr.kname, pr.mname, pr.msig);
+        mdo_valid = false;
+      }
+    }
+
+    if (pr.header_bytes != nullptr && mdo_valid) {
+      if (pr.rec.header_size == sizeof(MethodData::HeaderSnapshot)) {
+        MethodData::HeaderSnapshot snapshot;
+        Copy::conjoint_jbytes(pr.header_bytes, (char*)&snapshot, pr.rec.header_size);
+        if (!mdo->restore_header(snapshot)) {
+          mdo_valid = false;
+        }
+      } else {
+        mdo_valid = false;
+      }
+    }
+
+    if (mdo_valid) {
+      mdo_valid = validate_mdo_bcis(mdo, target);
+    }
+
+    sanitize_type_entries(mdo);
+
+    // Restore MethodCounters
+    if (pr.rec.mc_size > 0) {
+      MethodCounters* mc = target->method_counters();
+      if (mc == nullptr) {
+        methodHandle mh(THREAD, target);
+        mc = Method::build_method_counters(THREAD, target);
+        if (HAS_PENDING_EXCEPTION) { CLEAR_PENDING_EXCEPTION; }
+      }
+      if (mc != nullptr) {
+        const size_t ic_sz = sizeof(InvocationCounter);
+        if (pr.rec.mc_size >= ic_sz * 2 + sizeof(jlong) + sizeof(float) + sizeof(jint)) {
+          char* p = pr.mc_bytes;
+          Copy::conjoint_jbytes(p, (char*)mc->invocation_counter(), (jlong)ic_sz); p += ic_sz;
+          Copy::conjoint_jbytes(p, (char*)mc->backedge_counter(), (jlong)ic_sz); p += ic_sz;
+          jlong prev_time = *(jlong*)p; p += sizeof(jlong);
+          mc->set_prev_time(prev_time);
+          float rate = *(float*)p; p += sizeof(float);
+          mc->set_rate(rate);
+          jint pec = *(jint*)p; p += sizeof(jint);
+          mc->set_prev_event_count(pec);
+        }
+      }
+    }
+
+    if (mdo_valid) {
+      trigger_eager_compile(target, pr.rec.comp_level, thread);
+      installed++;
+    }
+
+    free_pending_record(pr);
+  }
+
+  if (installed > 0) {
+    log_info(compilation)("MDO checkpoint: deferred install for %s: %d method(s) installed",
+                           kname, installed);
+  }
+
+  // Update the flag
+  {
+    MutexLocker ml(_pending_records_lock);
+    if (_pending_records->is_empty()) {
+      _has_pending = false;
+    }
+  }
 }
 
 // ============================================================================

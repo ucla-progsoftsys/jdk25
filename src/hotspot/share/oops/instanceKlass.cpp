@@ -92,6 +92,7 @@
 #include "runtime/threads.hpp"
 #include "services/classLoadingService.hpp"
 #include "services/finalizerService.hpp"
+#include "services/profileCheckpoint.hpp"
 #include "services/threadService.hpp"
 #include "utilities/dtrace.hpp"
 #include "utilities/events.hpp"
@@ -1333,6 +1334,11 @@ void InstanceKlass::initialize_impl(TRAPS) {
     set_initialization_state_and_notify(fully_initialized, CHECK);
     DEBUG_ONLY(vtable().verify(tty, true);)
     CompilationPolicy::replay_training_at_init(this, THREAD);
+    // Check for deferred MDO records from profile checkpoint loading.
+    // This is cheap when there are no pending records (single volatile read).
+    if (ProfileCheckpoint::has_pending_records()) {
+      ProfileCheckpoint::try_install_pending(this, jt);
+    }
   }
   else {
     // Step 10 and 11

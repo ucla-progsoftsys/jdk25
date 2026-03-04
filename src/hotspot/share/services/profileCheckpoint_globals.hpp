@@ -37,7 +37,12 @@
                                                                                \
   product(ccstr, EagerInitAfterLoadAllowlist, "", DIAGNOSTIC,                \
           "Comma-separated class name patterns (java/lang/*) allowed for "   \
-          "EagerInitAfterLoad")
+          "EagerInitAfterLoad")                                              \
+                                                                               \
+  product(ccstr, EagerInitAfterLoadDenylist, "", DIAGNOSTIC,                 \
+          "Comma-separated class name patterns to exclude from "             \
+          "EagerInitAfterLoad (checked after allowlist, prevents "           \
+          "class-init poisoning for classes with native deps)")
 
 DECLARE_FLAGS(PROFILECHECKPOINT_FLAGS)
 
