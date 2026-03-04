@@ -181,8 +181,10 @@ public:
   static void wait_for_compile_completion(class JavaThread* THREAD);
   static void scan_hidden_class_locators();
 
-  // Called from InstanceKlass::initialize_impl() to install deferred MDO records
-  // for classes whose classloader wasn't available at checkpoint load time.
+  // Called from InstanceKlass::initialize_impl() to:
+  //  (1) install deferred MDO records for classes whose classloader wasn't
+  //      available at checkpoint load time, and
+  //  (2) submit eager compiles previously deferred due to holder-not-initialized.
   static void try_install_pending(class InstanceKlass* k, class JavaThread* thread);
   static bool has_pending_records();
 };
