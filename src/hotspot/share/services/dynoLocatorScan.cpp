@@ -53,7 +53,7 @@ class DynoLocatorTable {
       _entries = new (mtInternal) GrowableArray<Entry>(8, mtInternal);
     }
     if (_lock == nullptr) {
-      _lock = new Mutex(Mutex::nosafepoint, "DynoLocatorTable");
+      _lock = new Mutex(Mutex::tty, "DynoLocatorTable");
     }
   }
 public:
@@ -540,7 +540,11 @@ static void process_invokedynamic(const constantPoolHandle& cp, int indy_index, 
   // BSM
   int pool_index = indy_info->constant_pool_index();
   BootstrapInfo bootstrap_specifier(cp, pool_index, indy_index);
-  oop bsm = cp->resolve_possibly_cached_constant_at(bootstrap_specifier.bsm_index(), jt);
+
+  // manual lookup
+  int bsm_pool_index = bootstrap_specifier.bsm_index();
+  int bsm_cache_index = cp->cp_to_object_index(bsm_pool_index);
+  oop bsm = (bsm_cache_index >= 0) ? cp->resolved_reference_at(bsm_cache_index) : nullptr;
   {
     RecordLocation rl(loc_buf, " <bsm>");
     record_call_site_obj(jt, bsm, loc_buf);
@@ -597,11 +601,11 @@ void DynoLocatorScan::scan_all_classes() {
     if (ik->is_hidden()) continue; // only scan non-hidden sources
 
 
-    const constantPoolHandle cp(jt, ik->constants());
+    const constantPoolHandle cp(Thread::current(), ik->constants());
     Array<Method*>* methods = ik->methods();
     for (int mi = 0; mi < methods->length(); mi++) {
       Method* m = methods->at(mi);
-      BytecodeStream bcs(methodHandle(jt, m));
+      BytecodeStream bcs(methodHandle(Thread::current(), m));
       while (!bcs.is_last_bytecode()) {
         Bytecodes::Code opcode = bcs.next();
         opcode = bcs.raw_code();
@@ -628,8 +632,8 @@ void DynoLocatorScan::scan_all_classes() {
       int len = cp->length();
       for (int i = 0; i < len; ++i) {
         if (cp->tag_at(i).is_method_handle()) {
-          bool found_it;
-          oop mh = cp->find_cached_constant_at(i, found_it, jt);
+          int cache_index = cp->cp_to_object_index(i);
+          oop mh = (cache_index >= 0) ? cp->resolved_reference_at(cache_index) : nullptr;
           if (mh != nullptr) {
             RecordLocation rl(loc_buf, " %d", i);
             record_mh(jt, mh, loc_buf);
