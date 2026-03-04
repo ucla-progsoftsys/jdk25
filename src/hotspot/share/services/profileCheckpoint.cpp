@@ -679,9 +679,19 @@ static void trigger_eager_compile(Method* target, u1 stored_level, JavaThread* t
   if (!EagerCompileAfterLoad) return;
   if (target == nullptr || thread == nullptr) return;
   if (!UseCompiler || !CompilationPolicy::is_compilation_enabled()) return;
-  if (target->is_abstract() || target->is_native()) return;
+  if (target->is_abstract() || target->is_native()) {
+    log_debug(compilation)("MDO checkpoint: eager compile SKIPPED (abstract/native) %s::%s%s",
+                           target->method_holder()->name()->as_utf8(),
+                           target->name()->as_utf8(), target->signature()->as_utf8());
+    return;
+  }
   InstanceKlass* holder = target->method_holder();
-  if (!holder->is_initialized()) return;
+  if (!holder->is_initialized()) {
+    log_info(compilation)("MDO checkpoint: eager compile SKIPPED (holder not initialized) %s::%s%s",
+                          holder->name()->as_utf8(),
+                          target->name()->as_utf8(), target->signature()->as_utf8());
+    return;
+  }
   CompLevel level = (CompLevel)stored_level;
   if (level < CompLevel_none) {
     level = CompLevel_none;
@@ -984,15 +994,22 @@ ProfileCheckpoint::Loader::LoadResult ProfileCheckpoint::Loader::load_from_file(
   JavaThread* THREAD = _thread; // For exception macros.
 
   // preload all classes
-  int classes_linked = 0;
+  int classes_total = classes.length();
+  int classes_resolved = 0;
   int classes_initialized = 0;
   int classes_init_failed = 0;
+  int classes_resolve_failed = 0;
+  int classes_hidden = 0;
+  int classes_hidden_resolved = 0;
+  int classes_linked_only = 0;
   for (int ci = 0; ci < classes.length(); ci++) {
     const ProfileCheckpoint::Class& cls = classes.at(ci);
     if ((int)cls.klass.id >= symtab.length()) {
       continue;
     }
     const char* cname = symtab.at((int)cls.klass.id);
+    bool is_hidden_locator = (cls.loader == LoaderId::HIDDEN) || (cname != nullptr && cname[0] == '@');
+    if (is_hidden_locator) classes_hidden++;
     // Get loader name from symtab if it's a NAMED loader
     const char* loader_name = nullptr;
     if (cls.loader == LoaderId::NAMED && cls.loader_name.id != 0xFFFFFFFF) {
@@ -1002,25 +1019,45 @@ ProfileCheckpoint::Loader::LoadResult ProfileCheckpoint::Loader::load_from_file(
     }
     InstanceKlass* holder = resolve_klass_utf8(cname, cls.loader, loader_name, THREAD);
     if (holder != nullptr) {
-      holder->initialize(THREAD);
-      if (HAS_PENDING_EXCEPTION) {
-        log_debug(compilation)("MDO checkpoint: init failed for %s, falling back to link", cname);
-        CLEAR_PENDING_EXCEPTION;
+      classes_resolved++;
+      if (is_hidden_locator) classes_hidden_resolved++;
+      // Only initialize classes from built-in loaders (BOOT, PLATFORM, SYSTEM).
+      // Custom/NAMED loader classes may have <clinit> dependencies that aren't
+      // available yet. A failed <clinit> permanently marks the class as erroneous.
+      // install_record() will initialize specific holders on demand for compilation.
+      bool safe_to_init = (cls.loader == LoaderId::BOOT ||
+                           cls.loader == LoaderId::PLATFORM ||
+                           cls.loader == LoaderId::SYSTEM);
+      if (safe_to_init) {
+        holder->initialize(THREAD);
+        if (HAS_PENDING_EXCEPTION) {
+          log_info(compilation)("MDO checkpoint: init FAILED for %s (loader=%d), falling back to link",
+                                cname, (int)cls.loader);
+          CLEAR_PENDING_EXCEPTION;
+          holder->link_class(THREAD);
+          if (HAS_PENDING_EXCEPTION) { CLEAR_PENDING_EXCEPTION; }
+          classes_init_failed++;
+        } else {
+          classes_initialized++;
+        }
+      } else {
         holder->link_class(THREAD);
         if (HAS_PENDING_EXCEPTION) { CLEAR_PENDING_EXCEPTION; }
-        classes_linked++;
-        classes_init_failed++;
-      } else {
-        classes_linked++;
-        classes_initialized++;
+        log_debug(compilation)("MDO checkpoint: link-only for custom-loader class %s (loader=%d)",
+                               cname, (int)cls.loader);
+        classes_linked_only++;
       }
     } else {
-      log_debug(compilation)("MDO checkpoint: preload class failed for %s (loader=%d)",
-                             cname, (int)cls.loader);
+      classes_resolve_failed++;
+      log_info(compilation)("MDO checkpoint: resolve FAILED for %s (loader=%d, hidden=%s)",
+                            cname, (int)cls.loader, is_hidden_locator ? "yes" : "no");
     }
   }
-  log_info(compilation)("MDO checkpoint: preloaded %d classes, initialized %d, init failed %d",
-                         classes_linked, classes_initialized, classes_init_failed);
+  log_info(compilation)("MDO checkpoint: class preload summary: total=%d resolved=%d initialized=%d "
+                         "init_failed=%d linked_only=%d resolve_failed=%d hidden=%d hidden_resolved=%d",
+                         classes_total, classes_resolved, classes_initialized,
+                         classes_init_failed, classes_linked_only, classes_resolve_failed,
+                         classes_hidden, classes_hidden_resolved);
 
   result.status = LoadStatus::Success;
   
@@ -1066,6 +1103,8 @@ ProfileCheckpoint::Loader::LoadResult ProfileCheckpoint::Loader::load_from_file(
   result.records_read = _records_read;
   result.records_installed = _records_installed;
   result.size_mismatch = _size_mismatch;
+  log_info(compilation)("MDO checkpoint: loaded %d records (%d installed, %d size mismatch)",
+                         _records_read, _records_installed, _size_mismatch);
   return result;
 }
 
@@ -1115,6 +1154,16 @@ public:
   virtual void do_klass(Klass* k) {
     if (k == nullptr || !k->is_instance_klass()) return;
     InstanceKlass* ik = InstanceKlass::cast(k);
+    // Skip hidden classes that have no dyno locator — they can never be
+    // resolved on the load side and just waste space in the checkpoint.
+    if (ik->is_hidden()) {
+      const char* loc = DynoLocatorScan::lookup(ik);
+      if (loc == nullptr) {
+        log_debug(compilation)("MDO checkpoint dump: skipping hidden class without locator: %s",
+                               ik->name()->as_utf8());
+        return;
+      }
+    }
     ProfileCheckpoint::Class c;
     c.loader = loader_id_from_klass(ik);
     // For NAMED loaders, intern the loader name
