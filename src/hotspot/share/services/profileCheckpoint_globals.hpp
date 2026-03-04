@@ -24,19 +24,21 @@
           "Load MDOs from MDOReplayLoadFile at VM startup (binary)")          \
                                                                                \
   product(bool, PrintMDOAtDump, false, DIAGNOSTIC,                            \
-          "Debug: print MethodData/MethodCounters for each dumped method")    \
+          "Debug: print MethodData/MethodCounters for each dumped method")   \
                                                                                \
   product(bool, PrintMDOAfterLoad, false, DIAGNOSTIC,                         \
-          "Debug: print MethodData/MethodCounters after loading each method")  \
+          "Debug: print MethodData/MethodCounters after loading each method") \
                                                                                \
-  product(bool, EagerCompileAfterLoad, false, DIAGNOSTIC,                      \
-          "After loading MDOs at startup, run eager compilation")           \
+  product(bool, EagerCompileAfterLoad, false, DIAGNOSTIC,                     \
+          "After loading MDOs at startup, run eager compilation")            \
                                                                                \
   product(bool, EagerInitAfterLoad, false, DIAGNOSTIC,                        \
-          "After loading MDOs, eagerly initialize all referenced classes")
+          "After loading MDOs, eagerly initialize allowlisted classes")      \
+                                                                               \
+  product(ccstr, EagerInitAfterLoadAllowlist, "", DIAGNOSTIC,                \
+          "Comma-separated class name patterns (java/lang/*) allowed for "   \
+          "EagerInitAfterLoad")
 
 DECLARE_FLAGS(PROFILECHECKPOINT_FLAGS)
 
 #endif // SHARE_SERVICES_PROFILECHECKPOINT_GLOBALS_HPP
-
-

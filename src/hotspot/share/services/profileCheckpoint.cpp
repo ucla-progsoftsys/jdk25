@@ -2,6 +2,7 @@
 #include "utilities/ostream.hpp"
 #include "classfile/systemDictionary.hpp"
 #include "classfile/symbolTable.hpp"
+#include "classfile/javaClasses.hpp"
 #include "classfile/classLoaderDataGraph.hpp"
 #include "classfile/classLoaderData.hpp"
 #include "services/profileCheckpoint_globals.hpp"
@@ -22,6 +23,7 @@
 #include "compiler/compileBroker.hpp"
 #include "compiler/compilerDefinitions.hpp"
 #include "memory/resourceArea.hpp"
+#include "utilities/stringUtils.hpp"
 #include "interpreter/linkResolver.hpp"
 #include "oops/constantPool.inline.hpp"
 #include "oops/cpCache.inline.hpp"
@@ -433,6 +435,102 @@ static Handle loader_handle_from_loader(ProfileCheckpoint::LoaderId loader_id, c
   }
 }
 
+static bool is_builtin_loader(ProfileCheckpoint::LoaderId loader_id) {
+  return loader_id == ProfileCheckpoint::LoaderId::BOOT ||
+         loader_id == ProfileCheckpoint::LoaderId::PLATFORM ||
+         loader_id == ProfileCheckpoint::LoaderId::SYSTEM;
+}
+
+static void normalize_class_pattern(const char* raw, char* normalized) {
+  int i = 0;
+  for (; raw[i] != '\0'; i++) {
+    // Support both java/lang/Foo and java.lang.Foo style patterns.
+    normalized[i] = (raw[i] == '.') ? '/' : raw[i];
+  }
+  normalized[i] = '\0';
+}
+
+static void build_eager_init_allowlist(GrowableArray<const char*>& patterns) {
+  if (EagerInitAfterLoadAllowlist == nullptr || EagerInitAfterLoadAllowlist[0] == '\0') {
+    return;
+  }
+
+  StringUtils::CommaSeparatedStringIterator iter(EagerInitAfterLoadAllowlist);
+  for (; *iter != nullptr; ++iter) {
+    const char* token = *iter;
+    if (token[0] == '\0') {
+      continue;
+    }
+    const size_t len = strlen(token);
+    char* normalized = NEW_RESOURCE_ARRAY(char, len + 1);
+    normalize_class_pattern(token, normalized);
+    patterns.append(normalized);
+  }
+}
+
+static bool class_matches_eager_init_allowlist(const char* klass_name,
+                                               const GrowableArray<const char*>& patterns) {
+  if (klass_name == nullptr || klass_name[0] == '\0' || klass_name[0] == '@') {
+    return false;
+  }
+  for (int i = 0; i < patterns.length(); i++) {
+    if (StringUtils::is_star_match(patterns.at(i), klass_name)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static void log_and_clear_pending_exception(const char* action,
+                                            const char* klass_name,
+                                            ProfileCheckpoint::LoaderId loader_id,
+                                            TRAPS) {
+  if (!HAS_PENDING_EXCEPTION) {
+    return;
+  }
+
+  ResourceMark rm(THREAD);
+  const char* kname = (klass_name != nullptr) ? klass_name : "<null>";
+  oop exception = PENDING_EXCEPTION;
+  stringStream exception_text;
+  java_lang_Throwable::print(exception, &exception_text);
+  log_info(compilation)("MDO checkpoint: %s FAILED for %s (loader=%d): %s",
+                        action, kname, (int)loader_id, exception_text.as_string());
+  CLEAR_PENDING_EXCEPTION;
+}
+
+static bool try_link_class(InstanceKlass* klass,
+                           const char* klass_name,
+                           ProfileCheckpoint::LoaderId loader_id,
+                           const char* action,
+                           TRAPS) {
+  if (klass == nullptr) {
+    return false;
+  }
+  klass->link_class(THREAD);
+  if (HAS_PENDING_EXCEPTION) {
+    log_and_clear_pending_exception(action, klass_name, loader_id, THREAD);
+    return false;
+  }
+  return true;
+}
+
+static bool try_initialize_class(InstanceKlass* klass,
+                                 const char* klass_name,
+                                 ProfileCheckpoint::LoaderId loader_id,
+                                 const char* action,
+                                 TRAPS) {
+  if (klass == nullptr) {
+    return false;
+  }
+  klass->initialize(THREAD);
+  if (HAS_PENDING_EXCEPTION) {
+    log_and_clear_pending_exception(action, klass_name, loader_id, THREAD);
+    return false;
+  }
+  return true;
+}
+
 static const char* get_klassname_utf8(InstanceKlass* ik) {
   if (ik == nullptr) {
     return "<null>";
@@ -635,8 +733,9 @@ static void apply_fixups(MethodData* mdo,
     }
     InstanceKlass* k = resolve_klass_utf8(cname, fx.loader, loader_name, THREAD);
     if (k != nullptr) {
-      k->initialize(THREAD);
-      if (HAS_PENDING_EXCEPTION) { CLEAR_PENDING_EXCEPTION; continue; }
+      if (!try_link_class(k, cname, fx.loader, "fixup link", THREAD)) {
+        continue;
+      }
       address cell_addr = (address)mdo + fx.offset_in_mdo;
       intptr_t* cell = (intptr_t*)cell_addr;
       *cell = TypeEntries::with_status(InstanceKlass::cast(k), *cell);
@@ -835,8 +934,9 @@ bool ProfileCheckpoint::Loader::install_record(const Record& rec,
     return false;
   }
 
-  holder->initialize(THREAD);
-  if (HAS_PENDING_EXCEPTION) { CLEAR_PENDING_EXCEPTION; }
+  if (!try_link_class(holder, kname, rec.key.loader, "record holder link", THREAD)) {
+    return false;
+  }
 
   if (target->method_data() == nullptr) {
     methodHandle mh(THREAD, target);
@@ -993,6 +1093,17 @@ ProfileCheckpoint::Loader::LoadResult ProfileCheckpoint::Loader::load_from_file(
 
   JavaThread* THREAD = _thread; // For exception macros.
 
+  GrowableArray<const char*> eager_init_allowlist(8);
+  build_eager_init_allowlist(eager_init_allowlist);
+  const bool eager_init_enabled = EagerInitAfterLoad && eager_init_allowlist.length() > 0;
+  if (EagerInitAfterLoad && !eager_init_enabled) {
+    log_warning(compilation)("MDO checkpoint: EagerInitAfterLoad is enabled but "
+                             "EagerInitAfterLoadAllowlist is empty; using link-only preload");
+  } else if (eager_init_enabled) {
+    log_info(compilation)("MDO checkpoint: EagerInitAfterLoad enabled with %d allowlist pattern(s)",
+                          eager_init_allowlist.length());
+  }
+
   // Two-pass class preload:
   // Pass 1: resolve all regular (non-hidden) classes first, so they're available
   //         in ClassLoaderDataGraph when DynoLocatorScan resolves hidden classes.
@@ -1000,12 +1111,15 @@ ProfileCheckpoint::Loader::LoadResult ProfileCheckpoint::Loader::load_from_file(
   //         enclosing classes loaded in pass 1).
   int classes_total = classes.length();
   int classes_resolved = 0;
+  int classes_init_attempted = 0;
   int classes_initialized = 0;
   int classes_init_failed = 0;
+  int classes_init_skipped = 0;
   int classes_resolve_failed = 0;
   int classes_hidden = 0;
   int classes_hidden_resolved = 0;
   int classes_linked_only = 0;
+  int classes_link_failed = 0;
 
   // Helper lambda for resolving and initializing/linking a class entry
   auto resolve_class_entry = [&](int ci) {
@@ -1024,27 +1138,33 @@ ProfileCheckpoint::Loader::LoadResult ProfileCheckpoint::Loader::load_from_file(
     if (holder != nullptr) {
       classes_resolved++;
       if (is_hidden_locator) classes_hidden_resolved++;
-      bool safe_to_init = (cls.loader == LoaderId::BOOT ||
-                           cls.loader == LoaderId::PLATFORM ||
-                           cls.loader == LoaderId::SYSTEM);
-      if (safe_to_init) {
-        holder->initialize(THREAD);
-        if (HAS_PENDING_EXCEPTION) {
-          log_info(compilation)("MDO checkpoint: init FAILED for %s (loader=%d), falling back to link",
-                                cname, (int)cls.loader);
-          CLEAR_PENDING_EXCEPTION;
-          holder->link_class(THREAD);
-          if (HAS_PENDING_EXCEPTION) { CLEAR_PENDING_EXCEPTION; }
-          classes_init_failed++;
-        } else {
+      const bool can_eager_init = is_builtin_loader(cls.loader) &&
+                                  class_matches_eager_init_allowlist(cname, eager_init_allowlist);
+      if (eager_init_enabled && can_eager_init) {
+        classes_init_attempted++;
+        if (try_initialize_class(holder, cname, cls.loader, "preload initialize", THREAD)) {
           classes_initialized++;
+        } else {
+          classes_init_failed++;
+          if (try_link_class(holder, cname, cls.loader, "preload fallback link", THREAD)) {
+            classes_linked_only++;
+          } else {
+            classes_link_failed++;
+          }
         }
       } else {
-        holder->link_class(THREAD);
-        if (HAS_PENDING_EXCEPTION) { CLEAR_PENDING_EXCEPTION; }
-        log_debug(compilation)("MDO checkpoint: link-only for custom-loader class %s (loader=%d)",
-                               cname, (int)cls.loader);
-        classes_linked_only++;
+        if (is_builtin_loader(cls.loader)) {
+          classes_init_skipped++;
+        }
+        if (try_link_class(holder, cname, cls.loader, "preload link", THREAD)) {
+          classes_linked_only++;
+        } else {
+          classes_link_failed++;
+        }
+        if (!is_builtin_loader(cls.loader)) {
+          log_debug(compilation)("MDO checkpoint: link-only for custom-loader class %s (loader=%d)",
+                                 cname, (int)cls.loader);
+        }
       }
     } else {
       classes_resolve_failed++;
@@ -1074,11 +1194,14 @@ ProfileCheckpoint::Loader::LoadResult ProfileCheckpoint::Loader::load_from_file(
     }
   }
 
-  log_info(compilation)("MDO checkpoint: class preload summary: total=%d resolved=%d initialized=%d "
-                         "init_failed=%d linked_only=%d resolve_failed=%d hidden=%d hidden_resolved=%d",
-                         classes_total, classes_resolved, classes_initialized,
-                         classes_init_failed, classes_linked_only, classes_resolve_failed,
-                         classes_hidden, classes_hidden_resolved);
+  log_info(compilation)("MDO checkpoint: class preload summary: total=%d resolved=%d "
+                         "init_attempted=%d initialized=%d init_failed=%d init_skipped=%d "
+                         "linked_only=%d link_failed=%d resolve_failed=%d hidden=%d hidden_resolved=%d",
+                         classes_total, classes_resolved,
+                         classes_init_attempted, classes_initialized,
+                         classes_init_failed, classes_init_skipped,
+                         classes_linked_only, classes_link_failed,
+                         classes_resolve_failed, classes_hidden, classes_hidden_resolved);
 
   result.status = LoadStatus::Success;
   

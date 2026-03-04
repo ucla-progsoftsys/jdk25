@@ -234,12 +234,11 @@ class HiddenLocatorParser {
       log_info(compilation)("DynoLocator @bci: class resolve failed for %s", klass);
       return nullptr;
     }
-    ik->initialize(_jt);
+    ik->link_class(_jt);
     if (_jt->has_pending_exception()) {
-      log_info(compilation)("DynoLocator @bci: class init failed for %s, trying link", klass);
+      log_info(compilation)("DynoLocator @bci: class link failed for %s", klass);
       _jt->clear_pending_exception();
-      ik->link_class(_jt);
-      if (_jt->has_pending_exception()) { _jt->clear_pending_exception(); return nullptr; }
+      return nullptr;
     }
     Method* m = ik->find_method(mnsym, mssym);
     if (m == nullptr) {
@@ -339,12 +338,11 @@ class HiddenLocatorParser {
       log_info(compilation)("DynoLocator @cpi: class resolve failed for %s", klass);
       return nullptr;
     }
-    ik->initialize(_jt);
+    ik->link_class(_jt);
     if (_jt->has_pending_exception()) {
-      log_info(compilation)("DynoLocator @cpi: class init failed for %s, trying link", klass);
+      log_info(compilation)("DynoLocator @cpi: class link failed for %s", klass);
       _jt->clear_pending_exception();
-      ik->link_class(_jt);
-      if (_jt->has_pending_exception()) { _jt->clear_pending_exception(); return nullptr; }
+      return nullptr;
     }
     const constantPoolHandle cp(_jt, ik->constants());
     if (cpi >= cp->length() || !cp->tag_at(cpi).is_method_handle()) return nullptr;
