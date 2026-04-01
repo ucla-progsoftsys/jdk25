@@ -90,6 +90,11 @@ public:
   // We use a fixed-size array in the portable format large enough for any
   // configuration. The actual number of valid entries is recorded in the header.
   static constexpr uint8_t MAX_TRAP_HIST_LENGTH = 64;
+
+  // Export all mature MDO profiles to a binary file.
+  // deopt_decay: multiplier (0.0–1.0) applied to deoptimization counts to
+  //   avoid overly conservative compilation in the target JVM.
+  static bool export_all_to_file(const char* filepath, float deopt_decay = 0.5f);
 };
 
 // --------------------------------------------------------------------------
