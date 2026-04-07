@@ -91,10 +91,36 @@ public:
   // configuration. The actual number of valid entries is recorded in the header.
   static constexpr uint8_t MAX_TRAP_HIST_LENGTH = 64;
 
+  // Compute a CRC32 fingerprint over a method's bytecodes.
+  // Used to detect stale profiles when method bodies change between runs.
+  static uint32_t compute_bytecode_fingerprint(const Method* method);
+
   // Export all mature MDO profiles to a binary file.
   // deopt_decay: multiplier (0.0–1.0) applied to deoptimization counts to
   //   avoid overly conservative compilation in the target JVM.
   static bool export_all_to_file(const char* filepath, float deopt_decay = 0.5f);
+
+  // Called from before_exit() to export if ExportMDOFile is set.
+  // Executes the export at a safepoint via VM_ExportMDO.
+  static void export_on_shutdown();
+
+  // --- Import API ---
+
+  // Initialize the import subsystem. Loads and parses the file, builds
+  // the in-memory lookup map. Called once during VM startup.
+  static void initialize_import(const char* filepath);
+
+  // Returns true if import data has been loaded and is available.
+  static bool has_import_data();
+
+  // Try to import an MDO for the given method. Returns a fully patched
+  // MethodData* allocated in the method holder's ClassLoaderData metaspace,
+  // or nullptr if no matching entry exists or validation fails.
+  // The caller is responsible for installing it via Atomic::replace_if_null.
+  static MethodData* try_import(const methodHandle& method, TRAPS);
+
+  // Cleanup — release import data structures. Called during VM shutdown.
+  static void shutdown_import();
 };
 
 // --------------------------------------------------------------------------

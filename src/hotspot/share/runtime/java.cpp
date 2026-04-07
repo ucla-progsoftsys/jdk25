@@ -58,6 +58,7 @@
 #include "oops/method.inline.hpp"
 #include "oops/objArrayOop.hpp"
 #include "oops/oop.inline.hpp"
+#include "oops/portableMDO.hpp"
 #include "oops/symbol.hpp"
 #include "prims/jvmtiAgentList.hpp"
 #include "prims/jvmtiExport.hpp"
@@ -481,6 +482,12 @@ void before_exit(JavaThread* thread, bool halt) {
     MetaspaceShared::preload_and_dump(thread);
   }
 #endif
+
+  // Export MDO profiles if requested (must happen while metadata is alive)
+  PortableMDO::export_on_shutdown();
+
+  // Release portable MDO import resources (symbol refcounts, C-heap buffers)
+  PortableMDO::shutdown_import();
 
   // Hang forever on exit if we're reporting an error.
   if (ShowMessageBoxOnError && VMError::is_error_reported()) {

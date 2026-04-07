@@ -1377,6 +1377,16 @@ const int ObjectAlignmentInBytes = 8;
   product(int, SpecTrapLimitExtraEntries,  3, EXPERIMENTAL,                 \
           "Extra method data trap entries for speculation")                 \
                                                                             \
+  product(ccstr, ExportMDOFile, nullptr, DIAGNOSTIC,                         \
+          "Export mature MDO profiles to this file on JVM shutdown")         \
+                                                                            \
+  product(ccstr, ImportMDOFile, nullptr, DIAGNOSTIC,                         \
+          "Import MDO profiles from this file on JVM startup")              \
+                                                                            \
+  product(uint, MDOExportDeoptDecayPercent, 50, DIAGNOSTIC,                  \
+          "Percentage to decay deopt trap counts on MDO export (0-100)")    \
+          range(0, 100)                                                     \
+                                                                            \
   product(double, InlineFrequencyRatio, 0.25, DIAGNOSTIC,                   \
           "Ratio of call site execution to caller method invocation")       \
                                                                             \

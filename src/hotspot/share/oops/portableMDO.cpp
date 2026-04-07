@@ -25,16 +25,23 @@
 #include "classfile/classLoader.hpp"
 #include "classfile/classLoaderDataGraph.hpp"
 #include "classfile/symbolTable.hpp"
+#include "classfile/systemDictionary.hpp"
 #include "logging/log.hpp"
+#include "memory/allocation.hpp"
+#include "memory/metadataFactory.hpp"
 #include "memory/resourceArea.hpp"
 #include "oops/instanceKlass.hpp"
 #include "oops/klass.hpp"
 #include "oops/method.hpp"
 #include "oops/methodData.hpp"
 #include "oops/portableMDO.hpp"
+#include "runtime/atomic.hpp"
 #include "runtime/globals.hpp"
+#include "runtime/handles.inline.hpp"
 #include "runtime/os.hpp"
 #include "runtime/safepoint.hpp"
+#include "runtime/vmOperation.hpp"
+#include "runtime/vmThread.hpp"
 #include "runtime/vm_version.hpp"
 #include "utilities/growableArray.hpp"
 #include "utilities/resourceHash.hpp"
@@ -100,6 +107,21 @@ public:
       _error = true;
     }
   }
+
+  void patch_struct_at(size_t offset, const void* data, size_t len) {
+    if (_error) return;
+    long current = ftell(_file);
+    if (fseek(_file, (long)offset, SEEK_SET) != 0) {
+      _error = true;
+      return;
+    }
+    if (fwrite(data, 1, len, _file) != len) {
+      _error = true;
+    }
+    if (fseek(_file, current, SEEK_SET) != 0) {
+      _error = true;
+    }
+  }
 };
 
 // --------------------------------------------------------------------------
@@ -145,6 +167,12 @@ public:
   // Returns index into table, or PortableMDO::NULL_KLASS_REF if discarded.
   int16_t add_or_discard(const Klass* k) {
     if (k == nullptr) return PortableMDO::NULL_KLASS_REF;
+    // ReceiverTypeData::receiver() returns raw cell values cast to Klass*.
+    // Some cells may contain small non-pointer values (residual data from
+    // cleared slots, or tagged intptr values). Reject anything that cannot
+    // be a valid metaspace pointer.
+    if ((uintptr_t)k < (uintptr_t)os::vm_page_size()) return PortableMDO::NULL_KLASS_REF;
+    if (((uintptr_t)k & (alignof(Klass) - 1)) != 0) return PortableMDO::NULL_KLASS_REF;
     if (k->is_hidden()) return PortableMDO::NULL_KLASS_REF;
     if (k->class_loader_data() == nullptr || !k->class_loader_data()->is_alive()) {
       return PortableMDO::NULL_KLASS_REF;
@@ -256,7 +284,7 @@ public:
 // Bytecode fingerprint
 // --------------------------------------------------------------------------
 
-static uint32_t compute_bytecode_fingerprint(const Method* method) {
+uint32_t PortableMDO::compute_bytecode_fingerprint(const Method* method) {
   int code_size = method->code_size();
   if (code_size == 0) return 0;
   address code_base = method->constMethod()->code_base();
@@ -510,8 +538,8 @@ static int export_extra_data(PortableMDOWriter* writer,
     ehdr.flags = dp->flags();
 
     if (dp->tag() == DataLayout::speculative_trap_data_tag) {
-      SpeculativeTrapData* data = new SpeculativeTrapData(dp);
-      Method* m = data->method();
+      SpeculativeTrapData data(dp);
+      Method* m = data.method();
       int16_t method_idx = method_table->add_or_discard(m, klass_table);
 
       ehdr.tag = PortableExtraTag::SPECULATIVE_TRAP;
@@ -579,13 +607,34 @@ static int export_exception_handlers(PortableMDOWriter* writer,
 // ArgInfoData export
 // --------------------------------------------------------------------------
 
+// Walk extra data to find ArgInfoData. Acquires the extra data lock.
+// Returns the DataLayout* for the ArgInfoData entry, or nullptr if not found.
+// Caller constructs the ArgInfoData wrapper on the stack.
+static DataLayout* find_arg_info_layout(MethodData* mdo) {
+  Mutex* lock = mdo->extra_data_lock();
+  MutexLocker ml(lock, Mutex::_no_safepoint_check_flag);
+  DataLayout* dp = mdo->extra_data_base();
+  DataLayout* end = mdo->args_data_limit();
+  for (; dp < end; dp = MethodData::next_extra(dp)) {
+    if (dp->tag() == DataLayout::arg_info_data_tag) {
+      return dp;
+    }
+  }
+  return nullptr;
+}
+
 static int export_arg_modified(PortableMDOWriter* writer,
                                 MethodData* mdo) {
   int count = mdo->method()->size_of_parameters();
   if (count == 0) return 0;
 
+  DataLayout* arg_dl = find_arg_info_layout(mdo);
   for (int i = 0; i < count; i++) {
-    uint8_t modified = (uint8_t)mdo->arg_modified(i);
+    uint8_t modified = 0;
+    if (arg_dl != nullptr) {
+      ArgInfoData args(arg_dl);
+      modified = (uint8_t)args.arg_modified(i);
+    }
     writer->write_u1(modified);
   }
   writer->align4();
@@ -648,7 +697,9 @@ static bool export_single_mdo(PortableMDOWriter* writer,
                                KlassRefTableBuilder* klass_table,
                                MethodRefTableBuilder* method_table,
                                float deopt_decay) {
-  ResourceMark rm;
+  // NOTE: no ResourceMark here — the caller's ResourceMark (in
+  // export_all_to_file) must stay alive so that the GrowableArrays
+  // backing klass_table and method_table are not freed prematurely.
   Method* method = mdo->method();
 
   // Write method identity
@@ -659,7 +710,7 @@ static bool export_single_mdo(PortableMDOWriter* writer,
   identity.name_length = (uint16_t)mname->utf8_length();
   identity.sig_length = (uint16_t)msig->utf8_length();
   identity._padding0 = 0;
-  identity.bytecode_fingerprint = compute_bytecode_fingerprint(method);
+  identity.bytecode_fingerprint = PortableMDO::compute_bytecode_fingerprint(method);
   writer->write_struct(&identity, sizeof(identity));
   writer->write_raw((const char*)mname->bytes(), identity.name_length);
   writer->write_raw((const char*)msig->bytes(), identity.sig_length);
@@ -702,8 +753,7 @@ static bool export_single_mdo(PortableMDOWriter* writer,
   counts.extra_record_count = extra_count;
   counts.param_type_count = param_count;
   counts.exception_handler_count = handler_count;
-  writer->patch_u4_at(counts_offset, *(uint32_t*)&counts);
-  writer->patch_u4_at(counts_offset + 4, *((uint32_t*)&counts + 1));
+  writer->patch_struct_at(counts_offset, &counts, sizeof(counts));
 
   return !writer->error();
 }
@@ -841,4 +891,1354 @@ bool PortableMDO::export_all_to_file(const char* filepath, float deopt_decay) {
            klass_table.length(), method_table.length(),
            writer.bytes_written());
   return true;
+}
+
+// --------------------------------------------------------------------------
+// VM_ExportMDO — safepoint VM operation for shutdown export
+// --------------------------------------------------------------------------
+
+class VM_ExportMDO : public VM_Operation {
+  const char* _filepath;
+  float _deopt_decay;
+  bool _result;
+public:
+  VM_ExportMDO(const char* filepath, float deopt_decay)
+    : _filepath(filepath), _deopt_decay(deopt_decay), _result(false) {}
+  VMOp_Type type() const { return VMOp_ExportMDO; }
+  void doit() {
+    _result = PortableMDO::export_all_to_file(_filepath, _deopt_decay);
+  }
+  bool result() const { return _result; }
+};
+
+void PortableMDO::export_on_shutdown() {
+  if (ExportMDOFile == nullptr) return;
+  float decay = (float)MDOExportDeoptDecayPercent / 100.0f;
+  VM_ExportMDO op(ExportMDOFile, decay);
+  VMThread::execute(&op);
+}
+
+// ==========================================================================
+//
+//  PHASE 3: MDO IMPORTER
+//
+// ==========================================================================
+
+// --------------------------------------------------------------------------
+// PortableMDOReader — binary stream reader with bounds checking
+// --------------------------------------------------------------------------
+
+class PortableMDOReader : public StackObj {
+  const uint8_t* _base;
+  const uint8_t* _end;
+  const uint8_t* _cursor;
+  bool _error;
+
+public:
+  PortableMDOReader(const uint8_t* base, size_t length)
+    : _base(base), _end(base + length), _cursor(base), _error(false) {}
+
+  bool error() const { return _error; }
+  size_t position() const { return (size_t)(_cursor - _base); }
+  size_t remaining() const { return _error ? 0 : (size_t)(_end - _cursor); }
+
+  void set_position(size_t offset) {
+    if (offset > (size_t)(_end - _base)) {
+      _error = true;
+      return;
+    }
+    _cursor = _base + offset;
+  }
+
+  bool read_raw(void* dest, size_t len) {
+    if (_error || _cursor + len > _end) {
+      _error = true;
+      return false;
+    }
+    memcpy(dest, _cursor, len);
+    _cursor += len;
+    return true;
+  }
+
+  uint8_t read_u1() {
+    uint8_t v = 0;
+    read_raw(&v, sizeof(v));
+    return v;
+  }
+
+  uint16_t read_u2() {
+    uint16_t v = 0;
+    read_raw(&v, sizeof(v));
+    return v;
+  }
+
+  uint32_t read_u4() {
+    uint32_t v = 0;
+    read_raw(&v, sizeof(v));
+    return v;
+  }
+
+  int16_t read_i2() {
+    int16_t v = 0;
+    read_raw(&v, sizeof(v));
+    return v;
+  }
+
+  int32_t read_i4() {
+    int32_t v = 0;
+    read_raw(&v, sizeof(v));
+    return v;
+  }
+
+  bool read_struct(void* dest, size_t len) {
+    return read_raw(dest, len);
+  }
+
+  // Skip len bytes
+  void skip(size_t len) {
+    if (_error || _cursor + len > _end) {
+      _error = true;
+      return;
+    }
+    _cursor += len;
+  }
+
+  // Read raw bytes without copying (returns pointer into the buffer)
+  const uint8_t* read_bytes(size_t len) {
+    if (_error || _cursor + len > _end) {
+      _error = true;
+      return nullptr;
+    }
+    const uint8_t* p = _cursor;
+    _cursor += len;
+    return p;
+  }
+
+  // Advance to 4-byte alignment
+  void align4() {
+    size_t pos = position();
+    size_t rem = pos % 4;
+    if (rem != 0) {
+      skip(4 - rem);
+    }
+  }
+};
+
+// --------------------------------------------------------------------------
+// Imported reference table entries (in-memory parsed form)
+// --------------------------------------------------------------------------
+
+struct ImportedKlassRef : public CHeapObj<mtInternal> {
+  Symbol* name;            // Interned symbol — has refcount
+  PortableClassLoaderTag loader_tag;
+  Klass* resolved;         // Cached resolution result, or nullptr
+  bool resolution_attempted;
+
+  ImportedKlassRef() : name(nullptr), loader_tag(PortableClassLoaderTag::BOOT),
+                       resolved(nullptr), resolution_attempted(false) {}
+};
+
+struct ImportedMethodRef : public CHeapObj<mtInternal> {
+  int16_t klass_ref_index;
+  Symbol* name;
+  Symbol* sig;
+
+  ImportedMethodRef() : klass_ref_index(-1), name(nullptr), sig(nullptr) {}
+};
+
+// --------------------------------------------------------------------------
+// Lookup key for the MDO entry map: (klass_name, method_name, method_sig)
+// --------------------------------------------------------------------------
+
+struct MDOLookupKey {
+  const Symbol* klass_name;
+  const Symbol* method_name;
+  const Symbol* method_sig;
+
+  bool operator==(const MDOLookupKey& other) const {
+    return klass_name == other.klass_name &&
+           method_name == other.method_name &&
+           method_sig == other.method_sig;
+  }
+};
+
+static unsigned mdo_lookup_key_hash(const MDOLookupKey& key) {
+  // Combine the Symbol* addresses — symbols are interned so pointer
+  // identity == value identity.
+  uintptr_t h = (uintptr_t)key.klass_name;
+  h = h * 31 + (uintptr_t)key.method_name;
+  h = h * 31 + (uintptr_t)key.method_sig;
+  return (unsigned)(h ^ (h >> 16));
+}
+
+static bool mdo_lookup_key_equals(const MDOLookupKey& a, const MDOLookupKey& b) {
+  return a == b;
+}
+
+// --------------------------------------------------------------------------
+// Parsed MDO entry — offset into the import buffer for fast reconstruction
+// --------------------------------------------------------------------------
+
+struct ImportedMDOEntry : public CHeapObj<mtInternal> {
+  // Identity
+  int16_t klass_ref_index;
+  Symbol* method_name;     // Interned
+  Symbol* method_sig;      // Interned
+  uint32_t bytecode_fingerprint;
+
+  // File offset where the header fields begin (after the identity block)
+  size_t header_fields_offset;
+
+  // File offset where the entry counts struct begins
+  size_t counts_offset;
+
+  // Counts (parsed eagerly for validation)
+  uint16_t record_count;
+  uint16_t extra_record_count;
+  uint16_t param_type_count;
+  uint16_t exception_handler_count;
+
+  // File offset where the records section begins
+  size_t records_offset;
+
+  // Total byte length of this entry (for skipping)
+  size_t total_length;
+
+  ImportedMDOEntry() : klass_ref_index(-1), method_name(nullptr), method_sig(nullptr),
+                       bytecode_fingerprint(0), header_fields_offset(0),
+                       counts_offset(0), record_count(0), extra_record_count(0),
+                       param_type_count(0), exception_handler_count(0),
+                       records_offset(0), total_length(0) {}
+};
+
+// --------------------------------------------------------------------------
+// Import state — file-scope globals (only one import file at a time)
+// --------------------------------------------------------------------------
+
+static uint8_t*                _import_buffer = nullptr;
+static size_t                  _import_buffer_size = 0;
+static PortableMDOFileHeader   _import_header;
+static ImportedKlassRef*       _import_klass_refs = nullptr;
+static int                     _import_klass_ref_count = 0;
+static ImportedMethodRef*      _import_method_refs = nullptr;
+static int                     _import_method_ref_count = 0;
+static ImportedMDOEntry*       _import_entries = nullptr;
+static int                     _import_entry_count = 0;
+
+// Lookup map: (klass_name, method_name, sig) -> entry index
+using MDOLookupMap = ResourceHashtable<MDOLookupKey, int,
+                                        1024,
+                                        AnyObj::C_HEAP, mtInternal,
+                                        mdo_lookup_key_hash,
+                                        mdo_lookup_key_equals>;
+static MDOLookupMap*           _import_lookup_map = nullptr;
+static bool                    _import_initialized = false;
+
+// --------------------------------------------------------------------------
+// Header validation
+// --------------------------------------------------------------------------
+
+static bool validate_import_header(const PortableMDOFileHeader* hdr) {
+  if (hdr->magic != PortableMDO::MAGIC) {
+    log_error(aot, training)("PortableMDO import: bad magic 0x%08x (expected 0x%08x)",
+             hdr->magic, PortableMDO::MAGIC);
+    return false;
+  }
+  if (hdr->format_version != PortableMDO::FORMAT_VERSION) {
+    log_error(aot, training)("PortableMDO import: unsupported format version %u (expected %u)",
+             hdr->format_version, PortableMDO::FORMAT_VERSION);
+    return false;
+  }
+  // JDK version hash check
+  uint32_t current_hash = compute_jdk_version_hash();
+  if (hdr->jdk_version_hash != current_hash) {
+    log_error(aot, training)("PortableMDO import: JDK version mismatch "
+             "(file=0x%08x, current=0x%08x)", hdr->jdk_version_hash, current_hash);
+    return false;
+  }
+  // Pointer size check
+  if (hdr->pointer_size != (uint8_t)sizeof(void*)) {
+    log_error(aot, training)("PortableMDO import: pointer size mismatch "
+             "(file=%u, current=%u)", hdr->pointer_size, (uint8_t)sizeof(void*));
+    return false;
+  }
+  // Endianness check
+  uint8_t current_endianness;
+#ifdef VM_LITTLE_ENDIAN
+  current_endianness = 0;
+#else
+  current_endianness = 1;
+#endif
+  if (hdr->endianness != current_endianness) {
+    log_error(aot, training)("PortableMDO import: endianness mismatch "
+             "(file=%u, current=%u)", hdr->endianness, current_endianness);
+    return false;
+  }
+  // Sanity check counts
+  if (hdr->mdo_entry_count > PortableMDO::MAX_MDO_ENTRY_COUNT) {
+    log_error(aot, training)("PortableMDO import: too many MDO entries (%u)",
+             hdr->mdo_entry_count);
+    return false;
+  }
+  return true;
+}
+
+// --------------------------------------------------------------------------
+// Parse klass reference table
+// --------------------------------------------------------------------------
+
+static bool parse_klass_ref_table(PortableMDOReader* reader,
+                                   const PortableMDOFileHeader* hdr) {
+  reader->set_position(hdr->klass_ref_table_offset);
+  if (reader->error()) return false;
+
+  int count = (int)hdr->klass_ref_count;
+  if (count > PortableMDO::MAX_KLASS_REF_COUNT) return false;
+
+  _import_klass_refs = NEW_C_HEAP_ARRAY(ImportedKlassRef, count, mtInternal);
+  _import_klass_ref_count = count;
+
+  for (int i = 0; i < count; i++) {
+    PortableKlassRefEntry entry;
+    if (!reader->read_struct(&entry, sizeof(entry))) return false;
+
+    if (entry.name_length > PortableMDO::MAX_UTF8_LENGTH) return false;
+    const uint8_t* name_bytes = reader->read_bytes(entry.name_length);
+    if (name_bytes == nullptr) return false;
+    reader->align4();
+
+    ImportedKlassRef* ref = &_import_klass_refs[i];
+    ref->name = SymbolTable::new_symbol((const char*)name_bytes, entry.name_length);
+    ref->loader_tag = entry.loader_tag;
+    ref->resolved = nullptr;
+    ref->resolution_attempted = false;
+  }
+  return !reader->error();
+}
+
+// --------------------------------------------------------------------------
+// Parse method reference table
+// --------------------------------------------------------------------------
+
+static bool parse_method_ref_table(PortableMDOReader* reader,
+                                    const PortableMDOFileHeader* hdr) {
+  reader->set_position(hdr->method_ref_table_offset);
+  if (reader->error()) return false;
+
+  int count = (int)hdr->method_ref_count;
+  if (count > PortableMDO::MAX_METHOD_REF_COUNT) return false;
+
+  _import_method_refs = NEW_C_HEAP_ARRAY(ImportedMethodRef, count, mtInternal);
+  _import_method_ref_count = count;
+
+  for (int i = 0; i < count; i++) {
+    PortableMethodRefEntry entry;
+    if (!reader->read_struct(&entry, sizeof(entry))) return false;
+
+    if (entry.name_length > PortableMDO::MAX_UTF8_LENGTH) return false;
+    if (entry.sig_length > PortableMDO::MAX_UTF8_LENGTH) return false;
+
+    const uint8_t* name_bytes = reader->read_bytes(entry.name_length);
+    if (name_bytes == nullptr) return false;
+    const uint8_t* sig_bytes = reader->read_bytes(entry.sig_length);
+    if (sig_bytes == nullptr) return false;
+    reader->align4();
+
+    ImportedMethodRef* ref = &_import_method_refs[i];
+    ref->klass_ref_index = (int16_t)entry.klass_ref_index;
+    ref->name = SymbolTable::new_symbol((const char*)name_bytes, entry.name_length);
+    ref->sig = SymbolTable::new_symbol((const char*)sig_bytes, entry.sig_length);
+  }
+  return !reader->error();
+}
+
+// --------------------------------------------------------------------------
+// Skip a single profile record (used during entry parsing to compute offsets)
+// --------------------------------------------------------------------------
+
+static bool skip_profile_record(PortableMDOReader* reader) {
+  PortableProfileRecordHeader hdr;
+  if (!reader->read_struct(&hdr, sizeof(hdr))) return false;
+
+  switch (hdr.tag) {
+    case DataLayout::bit_data_tag:
+      // No payload
+      break;
+
+    case DataLayout::counter_data_tag:
+      reader->skip(sizeof(PortableCounterDataPayload));
+      break;
+
+    case DataLayout::jump_data_tag:
+      reader->skip(sizeof(PortableJumpDataPayload));
+      break;
+
+    case DataLayout::receiver_type_data_tag:
+    case DataLayout::virtual_call_data_tag: {
+      PortableReceiverTypeDataPayload payload;
+      if (!reader->read_struct(&payload, sizeof(payload))) return false;
+      reader->skip(payload.num_rows * sizeof(PortableReceiverRow));
+      break;
+    }
+
+    case DataLayout::ret_data_tag: {
+      PortableRetDataPayload payload;
+      if (!reader->read_struct(&payload, sizeof(payload))) return false;
+      reader->skip(payload.num_rows * sizeof(PortableRetRow));
+      break;
+    }
+
+    case DataLayout::branch_data_tag:
+      reader->skip(sizeof(PortableBranchDataPayload));
+      break;
+
+    case DataLayout::multi_branch_data_tag: {
+      PortableMultiBranchDataPayload payload;
+      if (!reader->read_struct(&payload, sizeof(payload))) return false;
+      reader->skip(payload.num_cases * sizeof(uint32_t));
+      break;
+    }
+
+    case DataLayout::call_type_data_tag: {
+      PortableCallTypeDataPayload payload;
+      if (!reader->read_struct(&payload, sizeof(payload))) return false;
+      reader->skip(payload.num_args * sizeof(PortableSymbolicTypeEntry));
+      if (payload.has_return) {
+        reader->skip(sizeof(PortableSymbolicTypeEntry));
+      }
+      break;
+    }
+
+    case DataLayout::virtual_call_type_data_tag: {
+      PortableVirtualCallTypeDataPayload payload;
+      if (!reader->read_struct(&payload, sizeof(payload))) return false;
+      reader->skip(payload.num_receiver_rows * sizeof(PortableReceiverRow));
+      reader->skip(payload.num_args * sizeof(PortableSymbolicTypeEntry));
+      if (payload.has_return) {
+        reader->skip(sizeof(PortableSymbolicTypeEntry));
+      }
+      break;
+    }
+
+    default:
+      // Unknown tag — no payload assumed
+      break;
+  }
+  return !reader->error();
+}
+
+// --------------------------------------------------------------------------
+// Skip extra records
+// --------------------------------------------------------------------------
+
+static bool skip_extra_record(PortableMDOReader* reader) {
+  PortableExtraRecordHeader hdr;
+  if (!reader->read_struct(&hdr, sizeof(hdr))) return false;
+
+  if (hdr.tag == PortableExtraTag::SPECULATIVE_TRAP) {
+    reader->skip(sizeof(PortableSpeculativeTrapPayload));
+  }
+  // BIT_DATA has no payload beyond the header
+  return !reader->error();
+}
+
+// --------------------------------------------------------------------------
+// Parse MDO entries and build lookup map
+// --------------------------------------------------------------------------
+
+static bool parse_mdo_entries(PortableMDOReader* reader,
+                               const PortableMDOFileHeader* hdr) {
+  reader->set_position(hdr->mdo_entries_offset);
+  if (reader->error()) return false;
+
+  int count = (int)hdr->mdo_entry_count;
+  _import_entries = NEW_C_HEAP_ARRAY(ImportedMDOEntry, count, mtInternal);
+  _import_entry_count = count;
+
+  _import_lookup_map = new (mtInternal) MDOLookupMap();
+
+  for (int i = 0; i < count; i++) {
+    size_t entry_start = reader->position();
+    ImportedMDOEntry* entry = &_import_entries[i];
+
+    // Read method identity
+    PortableMDOMethodIdentity identity;
+    if (!reader->read_struct(&identity, sizeof(identity))) return false;
+
+    if (identity.name_length > PortableMDO::MAX_UTF8_LENGTH) return false;
+    if (identity.sig_length > PortableMDO::MAX_UTF8_LENGTH) return false;
+
+    const uint8_t* name_bytes = reader->read_bytes(identity.name_length);
+    if (name_bytes == nullptr) return false;
+    const uint8_t* sig_bytes = reader->read_bytes(identity.sig_length);
+    if (sig_bytes == nullptr) return false;
+    reader->align4();
+
+    entry->klass_ref_index = (int16_t)identity.klass_ref_index;
+    entry->method_name = SymbolTable::new_symbol((const char*)name_bytes, identity.name_length);
+    entry->method_sig = SymbolTable::new_symbol((const char*)sig_bytes, identity.sig_length);
+    entry->bytecode_fingerprint = identity.bytecode_fingerprint;
+
+    // Record offset of header fields
+    entry->header_fields_offset = reader->position();
+
+    // Skip header fields struct
+    reader->skip(sizeof(PortableMDOHeaderFields));
+    if (reader->error()) return false;
+
+    // Skip arg_modified bytes (count is in the header fields we just skipped)
+    // Re-read arg_modified_count from the header fields
+    PortableMDOReader hdr_reader(_import_buffer, _import_buffer_size);
+    hdr_reader.set_position(entry->header_fields_offset);
+    PortableMDOHeaderFields header_fields;
+    hdr_reader.read_struct(&header_fields, sizeof(header_fields));
+    uint16_t arg_modified_count = header_fields.arg_modified_count;
+    reader->skip(arg_modified_count);
+    reader->align4();
+
+    // Read counts
+    entry->counts_offset = reader->position();
+    PortableMDOEntryCounts counts;
+    if (!reader->read_struct(&counts, sizeof(counts))) return false;
+    entry->record_count = counts.record_count;
+    entry->extra_record_count = counts.extra_record_count;
+    entry->param_type_count = counts.param_type_count;
+    entry->exception_handler_count = counts.exception_handler_count;
+
+    // Record where records section begins
+    entry->records_offset = reader->position();
+
+    // Skip all profile records
+    for (uint16_t r = 0; r < counts.record_count; r++) {
+      if (!skip_profile_record(reader)) return false;
+    }
+
+    // Skip extra data records
+    for (uint16_t e = 0; e < counts.extra_record_count; e++) {
+      if (!skip_extra_record(reader)) return false;
+    }
+
+    // Skip parameter type entries
+    reader->skip(counts.param_type_count * sizeof(PortableSymbolicTypeEntry));
+
+    // Skip exception handler entries
+    reader->skip(counts.exception_handler_count * sizeof(PortableExceptionHandlerEntry));
+
+    if (reader->error()) return false;
+
+    entry->total_length = reader->position() - entry_start;
+
+    // Add to lookup map
+    if (entry->klass_ref_index >= 0 &&
+        entry->klass_ref_index < _import_klass_ref_count) {
+      MDOLookupKey key;
+      key.klass_name = _import_klass_refs[entry->klass_ref_index].name;
+      key.method_name = entry->method_name;
+      key.method_sig = entry->method_sig;
+      bool created;
+      _import_lookup_map->put_if_absent(key, i, &created);
+    }
+  }
+  return !reader->error();
+}
+
+// --------------------------------------------------------------------------
+// Klass resolution (lookup-only, no class loading triggered)
+// --------------------------------------------------------------------------
+
+static Handle classloader_handle_from_tag(PortableClassLoaderTag tag, Thread* current) {
+  switch (tag) {
+    case PortableClassLoaderTag::BOOT:
+      return Handle(); // null handle = bootstrap
+    case PortableClassLoaderTag::PLATFORM:
+      return Handle(current, SystemDictionary::java_platform_loader());
+    case PortableClassLoaderTag::APP:
+      return Handle(current, SystemDictionary::java_system_loader());
+    case PortableClassLoaderTag::CUSTOM:
+      // Custom classloaders can't be resolved by tag alone —
+      // would need additional name-based lookup.
+      return Handle();
+    default:
+      return Handle();
+  }
+}
+
+static Klass* resolve_imported_klass_ref(int16_t index, Thread* current) {
+  if (index < 0 || index >= _import_klass_ref_count) return nullptr;
+
+  ImportedKlassRef* ref = &_import_klass_refs[index];
+
+  // Return cached result if we already attempted resolution
+  if (ref->resolution_attempted) return ref->resolved;
+  ref->resolution_attempted = true;
+
+  // Custom loaders are not resolved
+  if (ref->loader_tag == PortableClassLoaderTag::CUSTOM) {
+    log_debug(aot, training)("PortableMDO import: skipping custom-loader klass %s",
+             ref->name->as_C_string());
+    return nullptr;
+  }
+
+  Handle loader = classloader_handle_from_tag(ref->loader_tag, current);
+  InstanceKlass* k = SystemDictionary::find_instance_klass(current, ref->name, loader);
+
+  if (k != nullptr) {
+    ref->resolved = k;
+  } else {
+    log_debug(aot, training)("PortableMDO import: unresolved klass %s",
+             ref->name->as_C_string());
+  }
+  return ref->resolved;
+}
+
+// --------------------------------------------------------------------------
+// Type entry reconstruction helper
+//
+// Reconstructs the intptr_t encoding for TypeStackSlotEntries and
+// ReturnTypeEntry from a PortableSymbolicTypeEntry.
+// --------------------------------------------------------------------------
+
+static intptr_t reconstruct_type_entry(const PortableSymbolicTypeEntry* entry,
+                                        Thread* current) {
+  intptr_t result = TypeEntries::type_none();
+
+  if (entry->null_seen) {
+    result |= TypeEntries::null_seen;
+  }
+
+  if (entry->type_unknown) {
+    result |= TypeEntries::type_unknown;
+  } else if (entry->klass_ref_index != PortableMDO::NULL_KLASS_REF) {
+    Klass* k = resolve_imported_klass_ref(entry->klass_ref_index, current);
+    if (k != nullptr) {
+      result = TypeEntries::with_status((intptr_t)k, result);
+    }
+    // If klass not resolved, leave as type_none with null_seen bit preserved
+  }
+
+  return result;
+}
+
+// --------------------------------------------------------------------------
+// Patch header fields into a freshly-allocated MethodData
+// --------------------------------------------------------------------------
+
+static void patch_import_header(MethodData* mdo,
+                                 PortableMDOReader* reader,
+                                 size_t header_offset,
+                                 size_t arg_modified_start) {
+  reader->set_position(header_offset);
+  PortableMDOHeaderFields hdr;
+  reader->read_struct(&hdr, sizeof(hdr));
+  if (reader->error()) return;
+
+  // Invocation / backedge counters
+  mdo->invocation_counter()->set(hdr.invocation_count);
+  mdo->backedge_counter()->set(hdr.backedge_count);
+
+  // Reset baseline counters so invocation_count() / backedge_count()
+  // return the imported values directly.
+  mdo->reset_start_counters();
+
+  // Trap histogram — write directly into CompilerCounters trap history.
+  // The trap_hist encoding: stored value = count + 1. Value 0 in the
+  // array means count of (uint)-1 = saturated. Value N means count N-1.
+  // We just set the raw byte: _trap_hist._array[i] = stored_value.
+  // The portable format stores decoded counts, so re-encode here.
+  uint trap_limit = MIN2((uint)_import_header.trap_hist_length,
+                          (uint)MethodData::trap_reason_limit());
+  for (uint i = 0; i < trap_limit; i++) {
+    uint count = hdr.trap_hist[i];
+    // Re-encode: the raw array stores count+1 (0 means saturated).
+    // We clamp to 254 since 255+1=0 would mean saturated.
+    if (count >= 255) {
+      // Set as saturated — but this shouldn't happen since export capped at 255
+      // To set saturated: call inc_trap_count until it saturates.
+      // Simpler: just set the raw byte. We need access to the underlying array.
+      // For now, use inc_trap_count in a loop.
+      for (uint j = 0; j < 256; j++) {
+        mdo->inc_trap_count(i);
+      }
+    } else {
+      for (uint j = 0; j < count; j++) {
+        mdo->inc_trap_count(i);
+      }
+    }
+  }
+
+  // Decompile count — increment one by one since there's only inc_decompile_count().
+  // IMPORTANT: MethodData::inc_decompile_count() has a side effect: if the
+  // count exceeds PerMethodRecompilationCutoff, it marks the method as
+  // not-compilable. We must cap the imported count to prevent this, since
+  // the purpose of importing profiles is to *enable* compilation, not block it.
+  uint decompile_cap = (PerMethodRecompilationCutoff > 0)
+      ? (uint)PerMethodRecompilationCutoff : (uint)hdr.nof_decompiles;
+  uint decompiles_to_import = MIN2((uint)hdr.nof_decompiles, decompile_cap);
+  for (uint d = 0; d < decompiles_to_import; d++) {
+    mdo->inc_decompile_count();
+  }
+
+  // Tenure traps
+  for (uint t = 0; t < hdr.tenure_traps; t++) {
+    mdo->inc_tenure_traps();
+  }
+
+  // Structural info
+  mdo->set_num_loops(hdr.num_loops);
+  mdo->set_num_blocks(hdr.num_blocks);
+
+  // Would profile
+  if (hdr.would_profile == 2) {
+    mdo->set_would_profile(true);
+  } else if (hdr.would_profile == 1) {
+    mdo->set_would_profile(false);
+  }
+
+  // Arg modified
+  reader->set_position(arg_modified_start);
+  DataLayout* arg_dl = find_arg_info_layout(mdo);
+  for (int a = 0; a < hdr.arg_modified_count; a++) {
+    uint8_t modified = reader->read_u1();
+    if (!reader->error() && arg_dl != nullptr) {
+      ArgInfoData args(arg_dl);
+      args.set_arg_modified(a, modified);
+    }
+  }
+}
+
+// --------------------------------------------------------------------------
+// Patch per-BCI profile records
+// --------------------------------------------------------------------------
+
+static void patch_profile_records(MethodData* mdo,
+                                   PortableMDOReader* reader,
+                                   size_t records_offset,
+                                   uint16_t record_count,
+                                   Thread* current) {
+  reader->set_position(records_offset);
+  if (reader->error()) return;
+
+  // Walk the live MDO data and the imported records in parallel,
+  // matching by bci + tag.
+  ProfileData* live_data = mdo->first_data();
+  int import_idx = 0;
+
+  while (mdo->is_valid(live_data) && import_idx < record_count) {
+    PortableProfileRecordHeader rec_hdr;
+    size_t rec_start = reader->position();
+    if (!reader->read_struct(&rec_hdr, sizeof(rec_hdr))) return;
+
+    // Try to match by bci and tag
+    if (live_data->bci() == rec_hdr.bci &&
+        ((DataLayout*)live_data->dp())->tag() == rec_hdr.tag) {
+      // Match — patch this live record
+
+      // Set trap state
+      ((DataLayout*)live_data->dp())->set_trap_state(rec_hdr.trap_state);
+
+      switch (rec_hdr.tag) {
+        case DataLayout::bit_data_tag: {
+          // No payload — flags are already in the DataLayout header.
+          // The flags byte has been exported; OR it onto the existing flags.
+          // DataLayout::set_flag_at is per-bit; just set the raw flags byte
+          // by OR'ing each bit that is set in the imported flags.
+          for (int bit = 0; bit < 8; bit++) {
+            if (rec_hdr.flags & (1 << bit)) {
+              ((DataLayout*)live_data->dp())->set_flag_at(bit);
+            }
+          }
+          break;
+        }
+
+        case DataLayout::counter_data_tag: {
+          PortableCounterDataPayload payload;
+          reader->read_struct(&payload, sizeof(payload));
+          CounterData* cd = live_data->as_CounterData();
+          cd->set_count(payload.count);
+          break;
+        }
+
+        case DataLayout::jump_data_tag: {
+          PortableJumpDataPayload payload;
+          reader->read_struct(&payload, sizeof(payload));
+          JumpData* jd = live_data->as_JumpData();
+          jd->set_taken(payload.taken);
+          // displacement already correct from allocate/initialize
+          break;
+        }
+
+        case DataLayout::receiver_type_data_tag:
+        case DataLayout::virtual_call_data_tag: {
+          PortableReceiverTypeDataPayload payload;
+          reader->read_struct(&payload, sizeof(payload));
+          ReceiverTypeData* rtd = live_data->as_ReceiverTypeData();
+          rtd->set_count(payload.count);
+
+          uint rows_to_read = payload.num_rows;
+          uint rows_to_patch = MIN2((uint)payload.num_rows, rtd->row_limit());
+
+          for (uint r = 0; r < rows_to_read; r++) {
+            PortableReceiverRow row;
+            reader->read_struct(&row, sizeof(row));
+            if (r < rows_to_patch) {
+              Klass* k = resolve_imported_klass_ref(row.klass_ref_index, current);
+              rtd->set_receiver(r, k);
+              rtd->set_receiver_count(r, k != nullptr ? row.count : 0);
+            }
+          }
+          break;
+        }
+
+        case DataLayout::ret_data_tag: {
+          PortableRetDataPayload payload;
+          reader->read_struct(&payload, sizeof(payload));
+          RetData* rd = live_data->as_RetData();
+          rd->set_count(payload.count);
+
+          uint rows_to_read = payload.num_rows;
+          uint rows_to_patch = MIN2((uint)payload.num_rows, RetData::row_limit());
+
+          // RetData layout per row (3 cells each):
+          //   cell[counter_cell_count + row*3 + 0] = bci
+          //   cell[counter_cell_count + row*3 + 1] = count
+          //   cell[counter_cell_count + row*3 + 2] = displacement (don't touch)
+          // counter_cell_count = 1 (from CounterData: count_off=0, counter_cell_count=1)
+          DataLayout* ret_dl = (DataLayout*)rd->dp();
+          for (uint r = 0; r < rows_to_read; r++) {
+            PortableRetRow row;
+            reader->read_struct(&row, sizeof(row));
+            if (r < rows_to_patch) {
+              // bci cell index: header_cells + counter_cell_count + r*3 + 0
+              // DataLayout cells start after the header, and ProfileData cell
+              // indices are relative to cell[0].
+              // CounterData: counter_cell_count = 1
+              // RetData: bci0_offset = 1, count0_offset = 2, displacement0_offset = 3
+              // ret_row_cell_count = 3
+              int bci_cell = 1 + r * 3 + 0;   // bci0_offset + r * ret_row_cell_count
+              int cnt_cell = 1 + r * 3 + 1;   // count0_offset + r * ret_row_cell_count
+              ret_dl->set_cell_at(bci_cell, (intptr_t)row.target_bci);
+              ret_dl->set_cell_at(cnt_cell, (intptr_t)row.count);
+              // displacement stays as initialized
+            }
+          }
+          break;
+        }
+
+        case DataLayout::branch_data_tag: {
+          PortableBranchDataPayload payload;
+          reader->read_struct(&payload, sizeof(payload));
+          BranchData* bd = live_data->as_BranchData();
+          bd->set_taken(payload.taken);
+          bd->set_not_taken(payload.not_taken);
+          // displacement already correct
+          break;
+        }
+
+        case DataLayout::multi_branch_data_tag: {
+          PortableMultiBranchDataPayload payload;
+          reader->read_struct(&payload, sizeof(payload));
+          MultiBranchData* mbd = live_data->as_MultiBranchData();
+
+          // MultiBranchData layout in cells (after array_len):
+          //   cell[array_start + 0] = default_count
+          //   cell[array_start + 1] = default_displacement
+          //   cell[array_start + 2 + i*2 + 0] = case_count[i]
+          //   cell[array_start + 2 + i*2 + 1] = case_displacement[i]
+          // array_start_off_set = 1 (from ArrayData), so cell indices are offset by 1
+          // from the DataLayout cell array.
+          // Use DataLayout::set_cell_at() which is public.
+          DataLayout* dl = (DataLayout*)live_data->dp();
+          // default_count is at cell index: array_start(1) + 0
+          dl->set_cell_at(1 + 0, (intptr_t)payload.default_count);
+
+          int ncases = MIN2((int)payload.num_cases, mbd->number_of_cases());
+          for (int c = 0; c < (int)payload.num_cases; c++) {
+            uint32_t cnt = reader->read_u4();
+            if (c < ncases) {
+              // case_count[c] is at cell index: array_start(1) + 2 + c*2 + 0
+              dl->set_cell_at(1 + 2 + c * 2, (intptr_t)cnt);
+            }
+          }
+          // displacements already correct from initialize()
+          break;
+        }
+
+        case DataLayout::call_type_data_tag: {
+          PortableCallTypeDataPayload payload;
+          reader->read_struct(&payload, sizeof(payload));
+          CallTypeData* ctd = live_data->as_CallTypeData();
+          ctd->set_count(payload.count);
+
+          // Argument types
+          for (uint8_t a = 0; a < payload.num_args; a++) {
+            PortableSymbolicTypeEntry ste;
+            reader->read_struct(&ste, sizeof(ste));
+            if (ctd->has_arguments() && a < (uint8_t)ctd->number_of_arguments()) {
+              intptr_t type_val = reconstruct_type_entry(&ste, current);
+              const_cast<TypeStackSlotEntries*>(ctd->args())->set_type(a, type_val);
+            }
+          }
+
+          // Return type
+          if (payload.has_return) {
+            PortableSymbolicTypeEntry ste;
+            reader->read_struct(&ste, sizeof(ste));
+            if (ctd->has_return()) {
+              intptr_t type_val = reconstruct_type_entry(&ste, current);
+              const_cast<ReturnTypeEntry*>(ctd->ret())->set_type(type_val);
+            }
+          }
+          break;
+        }
+
+        case DataLayout::virtual_call_type_data_tag: {
+          PortableVirtualCallTypeDataPayload payload;
+          reader->read_struct(&payload, sizeof(payload));
+          VirtualCallTypeData* vctd = live_data->as_VirtualCallTypeData();
+          vctd->set_count(payload.count);
+
+          // Receiver rows
+          uint rows_to_patch = MIN2((uint)payload.num_receiver_rows, vctd->row_limit());
+          for (uint r = 0; r < payload.num_receiver_rows; r++) {
+            PortableReceiverRow row;
+            reader->read_struct(&row, sizeof(row));
+            if (r < rows_to_patch) {
+              Klass* k = resolve_imported_klass_ref(row.klass_ref_index, current);
+              vctd->set_receiver(r, k);
+              vctd->set_receiver_count(r, k != nullptr ? row.count : 0);
+            }
+          }
+
+          // Argument types
+          for (uint8_t a = 0; a < payload.num_args; a++) {
+            PortableSymbolicTypeEntry ste;
+            reader->read_struct(&ste, sizeof(ste));
+            if (vctd->has_arguments() && a < (uint8_t)vctd->number_of_arguments()) {
+              intptr_t type_val = reconstruct_type_entry(&ste, current);
+              const_cast<TypeStackSlotEntries*>(vctd->args())->set_type(a, type_val);
+            }
+          }
+
+          // Return type
+          if (payload.has_return) {
+            PortableSymbolicTypeEntry ste;
+            reader->read_struct(&ste, sizeof(ste));
+            if (vctd->has_return()) {
+              intptr_t type_val = reconstruct_type_entry(&ste, current);
+              const_cast<ReturnTypeEntry*>(vctd->ret())->set_type(type_val);
+            }
+          }
+          break;
+        }
+
+        default:
+          // Unknown tag at this position — skip its data
+          // Re-seek past the record by re-skipping from rec_start
+          reader->set_position(rec_start);
+          skip_profile_record(reader);
+          break;
+      }
+
+      import_idx++;
+      live_data = mdo->next_data(live_data);
+
+    } else if (live_data->bci() < rec_hdr.bci) {
+      // Live data is behind the imported record — advance live_data,
+      // but re-read this imported record on the next iteration.
+      reader->set_position(rec_start);
+      live_data = mdo->next_data(live_data);
+
+    } else {
+      // Imported record BCI is behind live data — this record was for
+      // a bytecode that no longer has profile data. Skip it.
+      reader->set_position(rec_start);
+      skip_profile_record(reader);
+      import_idx++;
+    }
+  }
+
+  // Skip any remaining unmatched imported records
+  while (import_idx < record_count) {
+    skip_profile_record(reader);
+    import_idx++;
+  }
+}
+
+// --------------------------------------------------------------------------
+// Patch extra data records
+// --------------------------------------------------------------------------
+
+static void patch_extra_data(MethodData* mdo,
+                              PortableMDOReader* reader,
+                              uint16_t extra_count,
+                              Thread* current) {
+  if (extra_count == 0) return;
+
+  Mutex* lock = mdo->extra_data_lock();
+  MutexLocker ml(lock, Mutex::_no_safepoint_check_flag);
+
+  DataLayout* dp = mdo->extra_data_base();
+  DataLayout* end = mdo->args_data_limit();
+
+  for (uint16_t i = 0; i < extra_count; i++) {
+    PortableExtraRecordHeader ehdr;
+    if (!reader->read_struct(&ehdr, sizeof(ehdr))) return;
+
+    if (dp >= end) {
+      // No more room in extra data — skip remaining
+      if (ehdr.tag == PortableExtraTag::SPECULATIVE_TRAP) {
+        reader->skip(sizeof(PortableSpeculativeTrapPayload));
+      }
+      continue;
+    }
+
+    if (ehdr.tag == PortableExtraTag::SPECULATIVE_TRAP) {
+      PortableSpeculativeTrapPayload payload;
+      reader->read_struct(&payload, sizeof(payload));
+
+      // Resolve the method reference
+      Method* m = nullptr;
+      if (payload.method_ref_index >= 0 &&
+          payload.method_ref_index < _import_method_ref_count) {
+        ImportedMethodRef* mref = &_import_method_refs[payload.method_ref_index];
+        Klass* holder = resolve_imported_klass_ref(mref->klass_ref_index, current);
+        if (holder != nullptr && holder->is_instance_klass()) {
+          InstanceKlass* ik = InstanceKlass::cast(holder);
+          m = ik->find_method(mref->name, mref->sig);
+          // Don't install old methods
+          if (m != nullptr && m->is_old()) m = nullptr;
+        }
+      }
+
+      if (m != nullptr) {
+        // Initialize as a SpeculativeTrapData entry
+        int cell_count = SpeculativeTrapData::static_cell_count();
+        dp->initialize(DataLayout::speculative_trap_data_tag,
+                       ehdr.bci, cell_count);
+        dp->set_trap_state(ehdr.trap_state);
+        SpeculativeTrapData data(dp);
+        data.set_method(m);
+        dp = MethodData::next_extra(dp);
+      }
+      // If method not resolved, just skip this entry
+
+    } else if (ehdr.tag == PortableExtraTag::BIT_DATA) {
+      // Stray trap — install as a BitData entry
+      int cell_count = BitData::static_cell_count();
+      dp->initialize(DataLayout::bit_data_tag, ehdr.bci, cell_count);
+      dp->set_trap_state(ehdr.trap_state);
+      dp = MethodData::next_extra(dp);
+    }
+  }
+}
+
+// --------------------------------------------------------------------------
+// Patch parameter type data
+// --------------------------------------------------------------------------
+
+static void patch_parameter_types(MethodData* mdo,
+                                   PortableMDOReader* reader,
+                                   uint16_t param_count,
+                                   Thread* current) {
+  ParametersTypeData* params = mdo->parameters_type_data();
+  if (params == nullptr || param_count == 0) {
+    // Skip the data in the reader
+    reader->skip(param_count * sizeof(PortableSymbolicTypeEntry));
+    return;
+  }
+
+  int live_count = params->number_of_parameters();
+  const TypeStackSlotEntries* entries = params->parameters();
+
+  for (uint16_t i = 0; i < param_count; i++) {
+    PortableSymbolicTypeEntry ste;
+    reader->read_struct(&ste, sizeof(ste));
+    if (reader->error()) return;
+
+    if ((int)i < live_count) {
+      intptr_t type_val = reconstruct_type_entry(&ste, current);
+      // Set the raw intptr_t which includes Klass* | status_bits encoding
+      const_cast<TypeStackSlotEntries*>(entries)->set_type(i, type_val);
+    }
+  }
+}
+
+// --------------------------------------------------------------------------
+// Patch exception handler data
+// --------------------------------------------------------------------------
+
+static void patch_exception_handlers(MethodData* mdo,
+                                      PortableMDOReader* reader,
+                                      uint16_t handler_count) {
+  if (handler_count == 0) return;
+
+  DataLayout* dp = mdo->exception_handler_data_base();
+  DataLayout* end = mdo->exception_handler_data_limit();
+  int entry_size = DataLayout::compute_size_in_bytes(BitData::static_cell_count());
+
+  for (uint16_t i = 0; i < handler_count; i++) {
+    PortableExceptionHandlerEntry entry;
+    reader->read_struct(&entry, sizeof(entry));
+    if (reader->error()) return;
+
+    if (dp < end) {
+      // Match by BCI — the live MDO has exception handler entries
+      // in the same order as the bytecodes
+      BitData data(dp);
+      if (dp->bci() == entry.handler_bci && entry.entered) {
+        data.set_exception_handler_entered();
+      }
+      dp = (DataLayout*)((address)dp + entry_size);
+    }
+  }
+}
+
+// --------------------------------------------------------------------------
+// MDO reconstruction — the core import routine
+// --------------------------------------------------------------------------
+
+static MethodData* reconstruct_mdo(const methodHandle& method,
+                                    ImportedMDOEntry* entry,
+                                    TRAPS) {
+  // Step 1: Allocate MDO normally — this computes the correct layout,
+  // displacements, and initializes all cells to zero.
+  ClassLoaderData* loader = method->method_holder()->class_loader_data();
+  MethodData* mdo = MethodData::allocate(loader, method, CHECK_NULL);
+
+  PortableMDOReader reader(_import_buffer, _import_buffer_size);
+
+  // Step 2: Patch header fields
+  size_t arg_modified_start = entry->header_fields_offset + sizeof(PortableMDOHeaderFields);
+  patch_import_header(mdo, &reader, entry->header_fields_offset, arg_modified_start);
+
+  // Step 3: Patch per-BCI profile records
+  patch_profile_records(mdo, &reader, entry->records_offset,
+                        entry->record_count, THREAD);
+
+  // Step 4: Compute offset of extra records (after all profile records)
+  // The reader left off after the profile records, so current position
+  // is the start of extra data.
+  size_t extra_offset = reader.position();
+
+  // Step 5: Patch extra data
+  reader.set_position(extra_offset);
+  patch_extra_data(mdo, &reader, entry->extra_record_count, THREAD);
+
+  // Step 6: Patch parameter type data
+  patch_parameter_types(mdo, &reader, entry->param_type_count, THREAD);
+
+  // Step 7: Patch exception handler data
+  patch_exception_handlers(mdo, &reader, entry->exception_handler_count);
+
+  if (reader.error()) {
+    log_warning(aot, training)("PortableMDO import: read error during reconstruction of %s.%s%s",
+               method->method_holder()->external_name(),
+               method->name()->as_C_string(),
+               method->signature()->as_C_string());
+    MetadataFactory::free_metadata(loader, mdo);
+    return nullptr;
+  }
+
+  // Step 8: Fix up runtime state
+  // _hint_di is initialized to 0 by MethodData::allocate/initialize,
+  // which is correct (first_di() == 0). No fixup needed.
+
+  log_info(aot, training)("PortableMDO import: reconstructed MDO for %s.%s%s "
+           "(%d records, %d extra, %d params, %d handlers)",
+           method->method_holder()->external_name(),
+           method->name()->as_C_string(),
+           method->signature()->as_C_string(),
+           entry->record_count, entry->extra_record_count,
+           entry->param_type_count, entry->exception_handler_count);
+
+  return mdo;
+}
+
+// --------------------------------------------------------------------------
+// Public API: initialize_import
+// --------------------------------------------------------------------------
+
+void PortableMDO::initialize_import(const char* filepath) {
+  if (filepath == nullptr) return;
+  if (_import_initialized) return;
+
+  // Read the entire file into a C-heap buffer
+  FILE* file = os::fopen(filepath, "rb");
+  if (file == nullptr) {
+    log_error(aot, training)("PortableMDO import: failed to open %s", filepath);
+    return;
+  }
+
+  // Get file size
+  if (fseek(file, 0, SEEK_END) != 0) {
+    fclose(file);
+    log_error(aot, training)("PortableMDO import: failed to seek in %s", filepath);
+    return;
+  }
+  long file_size = ftell(file);
+  if (file_size <= 0 || (size_t)file_size < sizeof(PortableMDOFileHeader)) {
+    fclose(file);
+    log_error(aot, training)("PortableMDO import: file too small or empty: %s", filepath);
+    return;
+  }
+  if (fseek(file, 0, SEEK_SET) != 0) {
+    fclose(file);
+    return;
+  }
+
+  _import_buffer_size = (size_t)file_size;
+  _import_buffer = NEW_C_HEAP_ARRAY(uint8_t, _import_buffer_size, mtInternal);
+  size_t read = fread(_import_buffer, 1, _import_buffer_size, file);
+  fclose(file);
+
+  if (read != _import_buffer_size) {
+    log_error(aot, training)("PortableMDO import: short read from %s", filepath);
+    FREE_C_HEAP_ARRAY(uint8_t, _import_buffer);
+    _import_buffer = nullptr;
+    return;
+  }
+
+  // Validate header
+  memcpy(&_import_header, _import_buffer, sizeof(_import_header));
+  if (!validate_import_header(&_import_header)) {
+    FREE_C_HEAP_ARRAY(uint8_t, _import_buffer);
+    _import_buffer = nullptr;
+    return;
+  }
+
+  PortableMDOReader reader(_import_buffer, _import_buffer_size);
+
+  // Parse reference tables
+  if (!parse_klass_ref_table(&reader, &_import_header)) {
+    log_error(aot, training)("PortableMDO import: failed to parse klass ref table");
+    shutdown_import();
+    return;
+  }
+
+  if (!parse_method_ref_table(&reader, &_import_header)) {
+    log_error(aot, training)("PortableMDO import: failed to parse method ref table");
+    shutdown_import();
+    return;
+  }
+
+  // Parse MDO entries and build lookup map
+  if (!parse_mdo_entries(&reader, &_import_header)) {
+    log_error(aot, training)("PortableMDO import: failed to parse MDO entries");
+    shutdown_import();
+    return;
+  }
+
+  _import_initialized = true;
+
+  log_info(aot, training)("PortableMDO import: loaded %d MDO profiles from %s "
+           "(%d klass refs, %d method refs)",
+           _import_entry_count, filepath,
+           _import_klass_ref_count, _import_method_ref_count);
+}
+
+// --------------------------------------------------------------------------
+// Public API: has_import_data
+// --------------------------------------------------------------------------
+
+bool PortableMDO::has_import_data() {
+  return _import_initialized;
+}
+
+// --------------------------------------------------------------------------
+// Public API: try_import
+// --------------------------------------------------------------------------
+
+MethodData* PortableMDO::try_import(const methodHandle& method, TRAPS) {
+  if (!_import_initialized) return nullptr;
+
+  // Build lookup key from the method
+  InstanceKlass* holder = method->method_holder();
+  Symbol* klass_name = holder->name();
+  Symbol* method_name = method->name();
+  Symbol* method_sig = method->signature();
+
+  MDOLookupKey key;
+  key.klass_name = klass_name;
+  key.method_name = method_name;
+  key.method_sig = method_sig;
+
+  int* entry_idx = _import_lookup_map->get(key);
+  if (entry_idx == nullptr) {
+    log_trace(aot, training)("PortableMDO import: no entry for %s.%s%s",
+             klass_name->as_C_string(),
+             method_name->as_C_string(),
+             method_sig->as_C_string());
+    return nullptr;
+  }
+
+  ImportedMDOEntry* entry = &_import_entries[*entry_idx];
+
+  // Validate bytecode fingerprint
+  uint32_t current_fp = PortableMDO::compute_bytecode_fingerprint(method());
+  if (current_fp != entry->bytecode_fingerprint) {
+    log_info(aot, training)("PortableMDO import: fingerprint mismatch for %s.%s%s "
+             "(expected 0x%08x, got 0x%08x)",
+             holder->external_name(),
+             method_name->as_C_string(),
+             method_sig->as_C_string(),
+             entry->bytecode_fingerprint, current_fp);
+    return nullptr;
+  }
+
+  // Reconstruct the MDO
+  return reconstruct_mdo(method, entry, THREAD);
+}
+
+// --------------------------------------------------------------------------
+// Public API: shutdown_import
+// --------------------------------------------------------------------------
+
+void PortableMDO::shutdown_import() {
+  if (_import_buffer != nullptr) {
+    FREE_C_HEAP_ARRAY(uint8_t, _import_buffer);
+    _import_buffer = nullptr;
+  }
+  if (_import_klass_refs != nullptr) {
+    // Release symbol refcounts
+    for (int i = 0; i < _import_klass_ref_count; i++) {
+      if (_import_klass_refs[i].name != nullptr) {
+        _import_klass_refs[i].name->decrement_refcount();
+      }
+    }
+    FREE_C_HEAP_ARRAY(ImportedKlassRef, _import_klass_refs);
+    _import_klass_refs = nullptr;
+  }
+  if (_import_method_refs != nullptr) {
+    for (int i = 0; i < _import_method_ref_count; i++) {
+      if (_import_method_refs[i].name != nullptr) {
+        _import_method_refs[i].name->decrement_refcount();
+      }
+      if (_import_method_refs[i].sig != nullptr) {
+        _import_method_refs[i].sig->decrement_refcount();
+      }
+    }
+    FREE_C_HEAP_ARRAY(ImportedMethodRef, _import_method_refs);
+    _import_method_refs = nullptr;
+  }
+  if (_import_entries != nullptr) {
+    for (int i = 0; i < _import_entry_count; i++) {
+      if (_import_entries[i].method_name != nullptr) {
+        _import_entries[i].method_name->decrement_refcount();
+      }
+      if (_import_entries[i].method_sig != nullptr) {
+        _import_entries[i].method_sig->decrement_refcount();
+      }
+    }
+    FREE_C_HEAP_ARRAY(ImportedMDOEntry, _import_entries);
+    _import_entries = nullptr;
+  }
+  if (_import_lookup_map != nullptr) {
+    delete _import_lookup_map;
+    _import_lookup_map = nullptr;
+  }
+  _import_klass_ref_count = 0;
+  _import_method_ref_count = 0;
+  _import_entry_count = 0;
+  _import_initialized = false;
+  _import_buffer_size = 0;
 }
