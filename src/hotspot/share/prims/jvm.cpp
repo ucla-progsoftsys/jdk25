@@ -61,6 +61,7 @@
 #include "oops/instanceKlass.hpp"
 #include "oops/klass.inline.hpp"
 #include "oops/method.hpp"
+#include "oops/portableMDO.hpp"
 #include "oops/recordComponent.hpp"
 #include "oops/objArrayKlass.hpp"
 #include "oops/objArrayOop.inline.hpp"
@@ -3716,6 +3717,13 @@ JVM_ENTRY(jobjectArray, JVM_GetEnclosingMethodInfo(JNIEnv *env, jclass ofClass))
   }
   return (jobjectArray) JNIHandles::make_local(THREAD, dest());
 }
+JVM_END
+
+// Drain entrypoint for the Portable MDO eager-compilation pipeline.
+// Called from jdk.internal.misc.VM.waitForEagerCompilation() — see
+// PortableMDO::eager_compile_imported_methods for behavior.
+JVM_ENTRY(void, JVM_WaitForEagerCompilation(JNIEnv *env, jclass ignored))
+  PortableMDO::eager_compile_imported_methods(THREAD);
 JVM_END
 
 // Returns an array of java.lang.String objects containing the input arguments to the VM.

@@ -817,6 +817,8 @@ jint Threads::create_vm(JavaVMInitArgs* args, bool* canTryAgain) {
   CompileBroker::init_training_replay();
 
   // Initialize portable MDO import if requested (needs system/platform loaders cached)
+  // Note: when EagerCompilePortableMDO is set, on_class_linked() handles
+  // proactive MDO installation and compilation as each class is linked.
   PortableMDO::initialize_import(ImportMDOFile);
 
   AOTLinkedClassBulkLoader::replay_training_at_init_for_preloaded_classes(CHECK_JNI_ERR);

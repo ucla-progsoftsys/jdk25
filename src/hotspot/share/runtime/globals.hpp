@@ -1387,6 +1387,9 @@ const int ObjectAlignmentInBytes = 8;
           "Percentage to decay deopt trap counts on MDO export (0-100)")    \
           range(0, 100)                                                     \
                                                                             \
+  product(bool, EagerCompilePortableMDO, false, DIAGNOSTIC,                  \
+          "Eagerly compile methods with imported Portable MDO profiles")     \
+                                                                            \
   product(double, InlineFrequencyRatio, 0.25, DIAGNOSTIC,                   \
           "Ratio of call site execution to caller method invocation")       \
                                                                             \

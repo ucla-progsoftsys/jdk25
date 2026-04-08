@@ -26,6 +26,9 @@
 #include "classfile/classLoaderDataGraph.hpp"
 #include "classfile/symbolTable.hpp"
 #include "classfile/systemDictionary.hpp"
+#include "compiler/compileBroker.hpp"
+#include "compiler/compileTask.hpp"
+#include "compiler/compilationPolicy.hpp"
 #include "logging/log.hpp"
 #include "memory/allocation.hpp"
 #include "memory/metadataFactory.hpp"
@@ -33,6 +36,7 @@
 #include "oops/instanceKlass.hpp"
 #include "oops/klass.hpp"
 #include "oops/method.hpp"
+#include "oops/methodCounters.hpp"
 #include "oops/methodData.hpp"
 #include "oops/portableMDO.hpp"
 #include "runtime/atomic.hpp"
@@ -679,6 +683,10 @@ static void export_header_fields(PortableMDOWriter* writer,
   hdr.num_loops = (int16_t)mdo->num_loops();
   hdr.num_blocks = (int16_t)mdo->num_blocks();
   hdr.would_profile = mdo->would_profile() ? 2 : 1;
+
+  // Highest compilation level this method reached
+  MethodCounters* mc = mdo->method()->method_counters();
+  hdr.highest_comp_level = (mc != nullptr) ? (uint8_t)mc->highest_comp_level() : 0;
 
   // Escape analysis fields intentionally zeroed — recomputed by C2
 
@@ -2185,8 +2193,172 @@ MethodData* PortableMDO::try_import(const methodHandle& method, TRAPS) {
     return nullptr;
   }
 
-  // Reconstruct the MDO
+  // Reconstruct the MDO. Compilation is NOT triggered here — that is the
+  // job of the explicit Java-side drain (see eager_compile_imported_methods,
+  // exposed via jdk.internal.misc.VM.waitForEagerCompilation()).
   return reconstruct_mdo(method, entry, THREAD);
+}
+
+// --------------------------------------------------------------------------
+// Public API: on_class_linked
+// --------------------------------------------------------------------------
+//
+// Called from InstanceKlass::link_class_impl as soon as a class finishes
+// linking. This hook only INSTALLS imported MDOs — it never triggers
+// compilation. That keeps the path fully reentrant-safe: even if a future
+// drain compiles a method whose inlining causes more class loading, the
+// recursive on_class_linked just installs more MDOs (cheap, no locks
+// beyond the normal MDO allocation path).
+//
+// Compilation is performed exclusively by eager_compile_imported_methods,
+// which is invoked from Java via jdk.internal.misc.VM.waitForEagerCompilation()
+// at a controlled point after the application has finished its initial
+// class-loading burst.
+
+void PortableMDO::on_class_linked(InstanceKlass* klass, TRAPS) {
+  if (!_import_initialized) return;
+  if (!EagerCompilePortableMDO) return;
+
+  Symbol* klass_name = klass->name();
+
+  // Walk all methods in this class and check if we have imported profiles.
+  for (int i = 0; i < klass->methods()->length(); i++) {
+    Method* m = klass->methods()->at(i);
+    if (m->is_abstract() || m->is_native()) continue;
+
+    MDOLookupKey key;
+    key.klass_name = klass_name;
+    key.method_name = m->name();
+    key.method_sig = m->signature();
+
+    int* entry_idx = _import_lookup_map->get(key);
+    if (entry_idx == nullptr) continue;
+
+    // Force MDO creation which routes through try_import — pure
+    // reconstruction, no compilation.
+    if (m->method_data() == nullptr) {
+      methodHandle mh(THREAD, m);
+      m->build_profiling_method_data(mh, THREAD);
+      if (HAS_PENDING_EXCEPTION) { CLEAR_PENDING_EXCEPTION; }
+    }
+  }
+}
+
+// --------------------------------------------------------------------------
+// Public API: eager_compile_imported_methods
+// --------------------------------------------------------------------------
+
+void PortableMDO::eager_compile_imported_methods(TRAPS) {
+  if (!_import_initialized) return;
+  if (!UseCompiler || !CompilationPolicy::is_compilation_enabled()) return;
+
+  ResourceMark rm(THREAD);
+  int compiled = 0;
+  int skipped = 0;
+
+  log_info(aot, training)("PortableMDO: starting eager compilation of %d imported methods",
+           _import_entry_count);
+
+  for (int i = 0; i < _import_entry_count; i++) {
+    ImportedMDOEntry* entry = &_import_entries[i];
+
+    // Resolve the holder class
+    if (entry->klass_ref_index < 0 || entry->klass_ref_index >= _import_klass_ref_count) {
+      skipped++;
+      continue;
+    }
+    ImportedKlassRef* kref = &_import_klass_refs[entry->klass_ref_index];
+
+    // Skip custom classloader classes — we can't resolve them
+    if (kref->loader_tag == PortableClassLoaderTag::CUSTOM) {
+      skipped++;
+      continue;
+    }
+
+    // Use resolve_or_null to actually load the class if needed
+    Handle loader = classloader_handle_from_tag(kref->loader_tag, THREAD);
+    TempNewSymbol klass_sym = SymbolTable::new_symbol(kref->name->as_C_string(),
+                                                       (int)kref->name->utf8_length());
+    Klass* k = SystemDictionary::resolve_or_null(klass_sym, loader, THREAD);
+    if (HAS_PENDING_EXCEPTION) { CLEAR_PENDING_EXCEPTION; }
+    if (k == nullptr || !k->is_instance_klass()) {
+      skipped++;
+      continue;
+    }
+
+    InstanceKlass* holder = InstanceKlass::cast(k);
+
+    // Link the class if not already linked
+    holder->link_class(THREAD);
+    if (HAS_PENDING_EXCEPTION) { CLEAR_PENDING_EXCEPTION; }
+
+    // Find the method
+    Method* target = holder->find_method(entry->method_name, entry->method_sig);
+    if (target == nullptr || target->is_abstract() || target->is_native()) {
+      skipped++;
+      continue;
+    }
+
+    // Validate bytecode fingerprint
+    uint32_t current_fp = PortableMDO::compute_bytecode_fingerprint(target);
+    if (current_fp != entry->bytecode_fingerprint) {
+      skipped++;
+      continue;
+    }
+
+    // Ensure the MDO is installed (via try_import path)
+    methodHandle mh(THREAD, target);
+    if (target->method_data() == nullptr) {
+      target->build_profiling_method_data(mh, THREAD);
+      if (HAS_PENDING_EXCEPTION) { CLEAR_PENDING_EXCEPTION; }
+    }
+
+    if (target->method_data() == nullptr) {
+      skipped++;
+      continue;
+    }
+
+    // Read the stored compilation level from the header fields
+    PortableMDOReader hdr_reader(_import_buffer, _import_buffer_size);
+    hdr_reader.set_position(entry->header_fields_offset);
+    PortableMDOHeaderFields header_fields;
+    if (!hdr_reader.read_struct(&header_fields, sizeof(header_fields))) {
+      skipped++;
+      continue;
+    }
+
+    CompLevel level = (CompLevel)header_fields.highest_comp_level;
+    if (level < CompLevel_none) {
+      level = CompLevel_none;
+    } else if (level > CompLevel_full_optimization) {
+      level = CompLevel_full_optimization;
+    }
+    // Don't eagerly compile at level 0 (interpreted) — no benefit
+    if (level <= CompLevel_none) {
+      skipped++;
+      continue;
+    }
+
+    // Queue the method for compilation
+    CompileBroker::compile_method(mh, InvocationEntryBci, level,
+                                  0, CompileTask::Reason_MustBeCompiled, THREAD);
+    if (HAS_PENDING_EXCEPTION) { CLEAR_PENDING_EXCEPTION; }
+    compiled++;
+  }
+
+  // Wait for all compilations to complete
+  for (;;) {
+    CompileBroker::wait_for_no_active_tasks();
+    CompileQueue* q1 = CompileBroker::c1_compile_queue();
+    CompileQueue* q2 = CompileBroker::c2_compile_queue();
+    bool empty1 = (q1 == nullptr) || q1->is_empty();
+    bool empty2 = (q2 == nullptr) || q2->is_empty();
+    if (empty1 && empty2) break;
+    os::naked_short_sleep(1);
+  }
+
+  log_info(aot, training)("PortableMDO: eager compilation done: %d compiled, %d skipped",
+           compiled, skipped);
 }
 
 // --------------------------------------------------------------------------

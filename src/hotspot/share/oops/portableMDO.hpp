@@ -119,6 +119,19 @@ public:
   // The caller is responsible for installing it via Atomic::replace_if_null.
   static MethodData* try_import(const methodHandle& method, TRAPS);
 
+  // Eagerly compile all imported methods. Resolves classes, installs MDOs,
+  // and queues compilation at the stored comp_level. Blocks until all
+  // compilations complete. Called when EagerCompilePortableMDO is set.
+  // Must be called on a JavaThread after class loaders are available.
+  static void eager_compile_imported_methods(TRAPS);
+
+  // Called when a class is linked. If EagerCompilePortableMDO is set and
+  // import data is available, proactively installs MDOs and queues
+  // compilation for all methods in this class that have imported profiles.
+  // This ensures app classes get eagerly compiled at the earliest moment
+  // (class link time), not lazily when the interpreter requests profiling.
+  static void on_class_linked(InstanceKlass* klass, TRAPS);
+
   // Cleanup — release import data structures. Called during VM shutdown.
   static void shutdown_import();
 };
@@ -268,7 +281,12 @@ struct PortableMDOHeaderFields {
   // Would this method benefit from profiling?
   // 0 = unknown, 1 = no_profile, 2 = profile
   uint8_t  would_profile;
-  uint8_t  _padding0[3];
+
+  // Highest compilation level this method reached during the profiling run.
+  // Used as the target level for eager compilation on import.
+  // Values correspond to CompLevel enum (0=none, 1=simple, 4=full_optimization).
+  uint8_t  highest_comp_level;
+  uint8_t  _padding0[2];
 
   // ArgInfoData — per-argument modified flags
   uint16_t arg_modified_count;

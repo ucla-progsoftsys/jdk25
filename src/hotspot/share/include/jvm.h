@@ -171,6 +171,16 @@ JVM_IsSupportedJNIVersion(jint version);
 JNIEXPORT jobjectArray JNICALL
 JVM_GetVmArguments(JNIEnv *env);
 
+/*
+ * Drain the Portable MDO eager-compilation queue.
+ * Walks all imported MDO entries, ensures the holder classes are loaded
+ * and linked, installs the reconstructed MDOs, queues compilation at the
+ * recorded comp level, and blocks until the compile queues are empty.
+ * No-op when ImportMDOFile / EagerCompilePortableMDO are unset.
+ */
+JNIEXPORT void JNICALL
+JVM_WaitForEagerCompilation(JNIEnv *env, jclass ignored);
+
 JNIEXPORT jboolean JNICALL
 JVM_IsPreviewEnabled(void);
 

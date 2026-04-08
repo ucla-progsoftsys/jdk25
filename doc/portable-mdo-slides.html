@@ -1,0 +1,883 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Portable MDO: Cross-JVM Profile Data Transfer for OpenJDK</title>
+<style>
+/* ── Reset & base ─────────────────────────────────────── */
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{height:100%;overflow:hidden;font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:#0f172a;color:#e2e8f0}
+
+/* ── Slide deck engine ────────────────────────────────── */
+.deck{display:flex;transition:transform .5s cubic-bezier(.4,0,.2,1);height:100%;width:100%}
+.slide{min-width:100vw;min-height:100vh;display:flex;flex-direction:column;justify-content:center;padding:3rem 6rem;position:relative;overflow-y:auto}
+
+/* ── Theme colours ────────────────────────────────────── */
+.bg-dark{background:#0f172a}
+.bg-navy{background:linear-gradient(135deg,#0f172a 0%,#1e293b 100%)}
+.bg-accent{background:linear-gradient(135deg,#1e3a5f 0%,#0f172a 100%)}
+.bg-problem{background:linear-gradient(135deg,#3b0a0a 0%,#1a0505 100%)}
+.bg-fix{background:linear-gradient(135deg,#052e16 0%,#0a1f0f 100%)}
+.bg-results{background:linear-gradient(135deg,#1e1b4b 0%,#0f172a 100%)}
+
+/* ── Typography ───────────────────────────────────────── */
+h1{font-size:2.8rem;font-weight:800;line-height:1.15;margin-bottom:1rem;letter-spacing:-.02em}
+h2{font-size:2rem;font-weight:700;margin-bottom:.75rem;letter-spacing:-.01em}
+h3{font-size:1.35rem;font-weight:600;margin-bottom:.5rem}
+p,.desc{font-size:1.05rem;line-height:1.7;color:#94a3b8;max-width:58rem}
+.subtitle{font-size:1.25rem;color:#64748b;margin-bottom:1.5rem}
+.small{font-size:.85rem;color:#64748b}
+.accent{color:#38bdf8}
+.green{color:#4ade80}
+.red{color:#f87171}
+.yellow{color:#fbbf24}
+.orange{color:#fb923c}
+.purple{color:#a78bfa}
+.bold{font-weight:700}
+.mono{font-family:'JetBrains Mono','Fira Code','SF Mono',monospace}
+
+/* ── Layout helpers ───────────────────────────────────── */
+.cols{display:grid;grid-template-columns:1fr 1fr;gap:2.5rem;margin-top:1.5rem}
+.cols-3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:2rem;margin-top:1.5rem}
+.mt1{margin-top:1rem}.mt2{margin-top:2rem}.mt3{margin-top:3rem}
+.mb1{margin-bottom:1rem}.mb2{margin-bottom:2rem}
+.gap1{gap:1rem}
+
+/* ── Cards ────────────────────────────────────────────── */
+.card{background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);border-radius:.75rem;padding:1.25rem 1.5rem}
+.card-red{border-left:4px solid #f87171}
+.card-green{border-left:4px solid #4ade80}
+.card-blue{border-left:4px solid #38bdf8}
+.card-yellow{border-left:4px solid #fbbf24}
+.card-purple{border-left:4px solid #a78bfa}
+.card-orange{border-left:4px solid #fb923c}
+
+/* ── Code blocks ──────────────────────────────────────── */
+pre{background:rgba(0,0,0,.45);border:1px solid rgba(255,255,255,.08);border-radius:.5rem;padding:1rem 1.25rem;font-size:.82rem;line-height:1.6;overflow-x:auto;font-family:'JetBrains Mono','Fira Code','SF Mono',monospace;color:#cbd5e1}
+code{font-family:inherit}
+.hl-red{color:#fca5a5;font-weight:600}
+.hl-green{color:#86efac;font-weight:600}
+.hl-blue{color:#93c5fd;font-weight:600}
+.hl-yellow{color:#fde68a;font-weight:600}
+
+/* ── Diagrams (CSS-drawn) ─────────────────────────────── */
+.diagram{display:flex;align-items:center;justify-content:center;gap:1rem;margin:1.5rem 0;flex-wrap:wrap}
+.box{padding:.75rem 1.25rem;border-radius:.5rem;font-size:.9rem;font-weight:600;text-align:center;white-space:nowrap}
+.box-blue{background:rgba(56,189,248,.15);border:1px solid rgba(56,189,248,.4);color:#7dd3fc}
+.box-green{background:rgba(74,222,128,.15);border:1px solid rgba(74,222,128,.4);color:#86efac}
+.box-red{background:rgba(248,113,113,.15);border:1px solid rgba(248,113,113,.4);color:#fca5a5}
+.box-purple{background:rgba(167,139,250,.15);border:1px solid rgba(167,139,250,.4);color:#c4b5fd}
+.box-yellow{background:rgba(251,191,36,.15);border:1px solid rgba(251,191,36,.4);color:#fde68a}
+.box-gray{background:rgba(148,163,184,.1);border:1px solid rgba(148,163,184,.25);color:#94a3b8}
+.arrow{font-size:1.5rem;color:#475569}
+.arrow-down{font-size:1.3rem;color:#475569;text-align:center;margin:.25rem 0}
+
+/* ── Bullet lists ─────────────────────────────────────── */
+ul{list-style:none;padding-left:0}
+ul li{position:relative;padding-left:1.5rem;margin-bottom:.5rem;font-size:1rem;line-height:1.6;color:#94a3b8}
+ul li::before{content:'';position:absolute;left:0;top:.55rem;width:.45rem;height:.45rem;border-radius:50%;background:#38bdf8}
+ul.red li::before{background:#f87171}
+ul.green li::before{background:#4ade80}
+ul.yellow li::before{background:#fbbf24}
+
+/* ── Table ────────────────────────────────────────────── */
+table{border-collapse:collapse;width:100%;margin-top:1rem;font-size:.95rem}
+th{text-align:left;padding:.6rem 1rem;background:rgba(255,255,255,.06);color:#e2e8f0;font-weight:600;border-bottom:2px solid rgba(255,255,255,.1)}
+td{padding:.55rem 1rem;border-bottom:1px solid rgba(255,255,255,.05);color:#94a3b8}
+
+/* ── Slide counter ────────────────────────────────────── */
+.slide-num{position:absolute;bottom:1.5rem;right:2rem;font-size:.8rem;color:#475569}
+.tag{display:inline-block;font-size:.7rem;font-weight:600;padding:.2rem .6rem;border-radius:9999px;text-transform:uppercase;letter-spacing:.05em}
+.tag-red{background:rgba(248,113,113,.15);color:#fca5a5}
+.tag-green{background:rgba(74,222,128,.15);color:#86efac}
+.tag-blue{background:rgba(56,189,248,.15);color:#7dd3fc}
+.tag-yellow{background:rgba(251,191,36,.15);color:#fde68a}
+
+/* ── File layout diagram ──────────────────────────────── */
+.file-layout{display:flex;flex-direction:column;gap:2px;width:22rem;font-size:.8rem;font-family:'JetBrains Mono',monospace}
+.file-row{display:flex;align-items:center;padding:.4rem .8rem;border-radius:.25rem}
+.file-offset{width:4.5rem;color:#64748b;flex-shrink:0}
+.file-label{flex:1;font-weight:600}
+
+/* ── Navigation ───────────────────────────────────────── */
+.nav{position:fixed;bottom:1.5rem;left:50%;transform:translateX(-50%);display:flex;gap:.75rem;z-index:100}
+.nav button{background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.12);color:#94a3b8;padding:.45rem 1rem;border-radius:.5rem;cursor:pointer;font-size:.85rem;transition:all .2s}
+.nav button:hover{background:rgba(255,255,255,.15);color:#e2e8f0}
+.nav .counter{padding:.45rem .75rem;color:#475569;font-size:.85rem;font-family:'JetBrains Mono',monospace}
+
+/* ── Highlight animation ──────────────────────────────── */
+@keyframes fadeInUp{from{opacity:0;transform:translateY(1rem)}to{opacity:1;transform:translateY(0)}}
+.slide.active *{animation:fadeInUp .5s ease both}
+</style>
+</head>
+<body>
+
+<div class="deck" id="deck">
+
+<!-- ════════════════════════════════════════════════════════
+     SLIDE 1 — Title
+     ════════════════════════════════════════════════════════ -->
+<div class="slide bg-dark">
+  <div>
+    <p class="subtitle mono" style="color:#38bdf8">OpenJDK 25 &middot; HotSpot Runtime</p>
+    <h1 style="font-size:3.2rem">Portable MDO<br><span style="color:#38bdf8">Cross-JVM Profile Data Transfer</span></h1>
+    <p class="mt2" style="max-width:44rem">
+      A stable binary serialization format for exporting and importing
+      <span class="accent bold">MethodData (MDO)</span> profiling information across JVM instances,
+      enabling warm-start compilation without shared memory or CDS archives.
+    </p>
+    <div class="mt3" style="display:flex;gap:1rem;flex-wrap:wrap">
+      <span class="tag tag-blue">~2,700 lines C++</span>
+      <span class="tag tag-green">10 files modified</span>
+      <span class="tag tag-yellow">26 unit tests</span>
+      <span class="tag tag-red">6 runtime bugs found &amp; fixed</span>
+    </div>
+  </div>
+  <div class="slide-num">1</div>
+</div>
+
+<!-- ════════════════════════════════════════════════════════
+     SLIDE 2 — Problem Statement
+     ════════════════════════════════════════════════════════ -->
+<div class="slide bg-navy">
+  <div>
+    <p class="subtitle"><span class="yellow">&#9679;</span> The Problem</p>
+    <h1>JVM Warm-up Is Expensive</h1>
+    <div class="cols mt2">
+      <div>
+        <p>Every JVM instance starts <span class="bold accent">cold</span>. The C1/C2 JIT compilers
+           must re-collect profiling data from scratch before producing optimised code.</p>
+        <ul class="mt2">
+          <li>Invocation &amp; backedge counters start at zero</li>
+          <li>Receiver type profiles are empty</li>
+          <li>Branch/switch taken ratios are unknown</li>
+          <li>Deoptimization history is lost</li>
+        </ul>
+      </div>
+      <div class="card card-yellow">
+        <h3 class="yellow">Impact</h3>
+        <ul class="yellow mt1">
+          <li>Slow startup for latency-sensitive services</li>
+          <li>Wasted CPU re-profiling identical workloads</li>
+          <li>CDS/AOT caches don't carry profiling data</li>
+          <li>No portable way to transfer JIT hints</li>
+        </ul>
+        <p class="mt2 small">Existing solutions (CDS, Leyden AOT cache) focus on class data and
+          compiled code, but <span class="bold">not</span> on the profiling metadata that <em>guides</em>
+          compilation decisions.</p>
+      </div>
+    </div>
+  </div>
+  <div class="slide-num">2</div>
+</div>
+
+<!-- ════════════════════════════════════════════════════════
+     SLIDE 3 — Solution Overview
+     ════════════════════════════════════════════════════════ -->
+<div class="slide bg-accent">
+  <div>
+    <p class="subtitle"><span class="green">&#9679;</span> Our Solution</p>
+    <h1>Portable MDO Format</h1>
+    <p class="mt1">A self-contained binary file that captures a JVM's <span class="accent bold">profiling state</span>
+       at shutdown and restores it into a fresh JVM at startup.</p>
+
+    <div class="diagram mt3">
+      <div class="box box-blue">JVM 1<br><span class="small">warm workload</span></div>
+      <div class="arrow">&#8594;</div>
+      <div class="box box-yellow">ExportMDOFile<br><span class="small">safepoint VM op</span></div>
+      <div class="arrow">&#8594;</div>
+      <div class="box box-purple">.mdo file<br><span class="small">~40 KB</span></div>
+      <div class="arrow">&#8594;</div>
+      <div class="box box-yellow">ImportMDOFile<br><span class="small">startup hook</span></div>
+      <div class="arrow">&#8594;</div>
+      <div class="box box-green">JVM 2<br><span class="small">warm start</span></div>
+    </div>
+
+    <div class="cols-3 mt3">
+      <div class="card card-blue">
+        <h3 class="accent">Symbolic References</h3>
+        <p class="small">All Klass*/Method* pointers serialised as class names + classloader tags. Portable across address spaces.</p>
+      </div>
+      <div class="card card-green">
+        <h3 class="green">Logical Format</h3>
+        <p class="small">Profile data stored as (tag, bci, counters, type refs) — not raw DataLayout cells. Flag-independent.</p>
+      </div>
+      <div class="card card-purple">
+        <h3 class="purple">Fingerprint Validation</h3>
+        <p class="small">CRC32 over method bytecodes detects stale profiles when code changes between runs.</p>
+      </div>
+    </div>
+  </div>
+  <div class="slide-num">3</div>
+</div>
+
+<!-- ════════════════════════════════════════════════════════
+     SLIDE 4 — Architecture Diagram
+     ════════════════════════════════════════════════════════ -->
+<div class="slide bg-navy">
+  <div>
+    <p class="subtitle"><span class="accent">&#9679;</span> Architecture</p>
+    <h1>System Integration Points</h1>
+    <div class="cols mt2">
+      <div>
+        <h3 class="accent mb1">Export Path (Shutdown)</h3>
+        <div style="display:flex;flex-direction:column;gap:4px">
+          <div class="box box-gray" style="text-align:left;font-size:.8rem"><code>before_exit()</code> &rarr; <code>export_on_shutdown()</code></div>
+          <div class="arrow-down">&darr;</div>
+          <div class="box box-yellow" style="text-align:left;font-size:.8rem"><code>VM_ExportMDO</code> safepoint operation</div>
+          <div class="arrow-down">&darr;</div>
+          <div class="box box-blue" style="text-align:left;font-size:.8rem"><code>export_all_to_file()</code><br>&nbsp;&nbsp;collect_mature_mdos()<br>&nbsp;&nbsp;for each: export_single_mdo()</div>
+          <div class="arrow-down">&darr;</div>
+          <div class="box box-purple" style="text-align:left;font-size:.8rem">Write klass ref table &rarr; method ref table &rarr; patch header</div>
+        </div>
+      </div>
+      <div>
+        <h3 class="green mb1">Import Path (Startup)</h3>
+        <div style="display:flex;flex-direction:column;gap:4px">
+          <div class="box box-gray" style="text-align:left;font-size:.8rem"><code>Threads::create_vm()</code> &rarr; <code>initialize_import()</code></div>
+          <div class="arrow-down">&darr;</div>
+          <div class="box box-green" style="text-align:left;font-size:.8rem">Load file &rarr; parse klass/method ref tables &rarr; build lookup map</div>
+          <div class="arrow-down">&darr;</div>
+          <div class="box box-yellow" style="text-align:left;font-size:.8rem"><code>Method::build_profiling_method_data()</code><br>&nbsp;&nbsp;&rarr; <code>PortableMDO::try_import()</code></div>
+          <div class="arrow-down">&darr;</div>
+          <div class="box box-blue" style="text-align:left;font-size:.8rem">Lookup key match &rarr; fingerprint check &rarr; allocate MethodData &rarr; populate from records</div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="slide-num">4</div>
+</div>
+
+<!-- ════════════════════════════════════════════════════════
+     SLIDE 5 — File Format
+     ════════════════════════════════════════════════════════ -->
+<div class="slide bg-accent">
+  <div>
+    <p class="subtitle"><span class="purple">&#9679;</span> File Format</p>
+    <h1>Binary Layout <span class="mono small" style="color:#64748b">magic: 0x4A4D444F "JMDO"</span></h1>
+    <div class="cols mt2">
+      <div class="file-layout">
+        <div class="file-row" style="background:rgba(56,189,248,.12)">
+          <span class="file-offset">0x00</span>
+          <span class="file-label" style="color:#7dd3fc">PortableMDOFileHeader (52 bytes)</span>
+        </div>
+        <div class="file-row" style="background:rgba(251,191,36,.08)">
+          <span class="file-offset">0x34</span>
+          <span class="file-label" style="color:#fde68a">MDO Entry [0]</span>
+        </div>
+        <div class="file-row" style="background:rgba(251,191,36,.06)">
+          <span class="file-offset">&hellip;</span>
+          <span class="file-label" style="color:#fde68a">MDO Entry [N-1]</span>
+        </div>
+        <div class="file-row" style="background:rgba(74,222,128,.1)">
+          <span class="file-offset">var</span>
+          <span class="file-label" style="color:#86efac">Klass Ref Table</span>
+        </div>
+        <div class="file-row" style="background:rgba(167,139,250,.1)">
+          <span class="file-offset">var</span>
+          <span class="file-label" style="color:#c4b5fd">Method Ref Table</span>
+        </div>
+      </div>
+      <div>
+        <h3>Per-MDO Entry Structure</h3>
+        <div style="display:flex;flex-direction:column;gap:2px;font-size:.82rem;font-family:'JetBrains Mono',monospace;margin-top:.75rem">
+          <div style="padding:.3rem .6rem;background:rgba(56,189,248,.08);border-radius:.25rem;color:#7dd3fc">MethodIdentity (klass_ref, name, sig, fingerprint)</div>
+          <div style="padding:.3rem .6rem;background:rgba(251,191,36,.08);border-radius:.25rem;color:#fde68a">HeaderFields (counters, deopt, trap_hist, arg_modified)</div>
+          <div style="padding:.3rem .6rem;background:rgba(74,222,128,.08);border-radius:.25rem;color:#86efac">EntryCounts (records, extras, params, handlers)</div>
+          <div style="padding:.3rem .6rem;background:rgba(167,139,250,.08);border-radius:.25rem;color:#c4b5fd">ProfileRecords[] (tag + bci + payload per record)</div>
+          <div style="padding:.3rem .6rem;background:rgba(248,113,113,.08);border-radius:.25rem;color:#fca5a5">ExtraRecords[] (speculative traps, stray traps)</div>
+          <div style="padding:.3rem .6rem;background:rgba(148,163,184,.08);border-radius:.25rem;color:#94a3b8">ParameterTypes[] + ExceptionHandlers[]</div>
+        </div>
+        <p class="mt2 small">13 profile record types supported: BitData, CounterData, JumpData,
+          ReceiverTypeData, VirtualCallData, RetData, BranchData, MultiBranchData,
+          CallTypeData, VirtualCallTypeData, ParametersTypeData, and extra data.</p>
+      </div>
+    </div>
+  </div>
+  <div class="slide-num">5</div>
+</div>
+
+<!-- ════════════════════════════════════════════════════════
+     SLIDE 6 — Design Decisions
+     ════════════════════════════════════════════════════════ -->
+<div class="slide bg-navy">
+  <div>
+    <p class="subtitle"><span class="accent">&#9679;</span> Design Decisions</p>
+    <h1>Key Engineering Choices</h1>
+    <div class="cols-3 mt2">
+      <div class="card card-blue">
+        <h3 class="accent">Logical vs Raw</h3>
+        <p class="small mt1">Serialize at the logical level (tag + bci + typed counters) rather
+           than raw DataLayout cells. This makes the format independent of
+           TypeProfileWidth, BciProfileWidth, and other flag-dependent cell layouts.</p>
+      </div>
+      <div class="card card-green">
+        <h3 class="green">Hidden Class Elision</h3>
+        <p class="small mt1">Lambda/invokedynamic classes are discarded. Overflow counts are preserved
+           so the compiler still knows the call site is polymorphic and hot.</p>
+      </div>
+      <div class="card card-yellow">
+        <h3 class="yellow">Deopt Decay</h3>
+        <p class="small mt1">Deoptimization counters are multiplied by a configurable decay factor
+           (default 50%) at export. Prevents overly conservative compilation from
+           inherited deopt history.</p>
+      </div>
+      <div class="card card-purple">
+        <h3 class="purple">Safepoint Export</h3>
+        <p class="small mt1">Export runs as a VM_Operation at a safepoint during shutdown, ensuring
+           consistent MDO state. No locks needed — only the VM thread is active.</p>
+      </div>
+      <div class="card card-orange">
+        <h3 class="orange">Lazy Import</h3>
+        <p class="small mt1">Profiles are imported on-demand when <code>build_profiling_method_data()</code>
+           is called, not eagerly. Only methods that get hot enough to need profiling
+           receive imported data.</p>
+      </div>
+      <div class="card card-red">
+        <h3 class="red">No EA Export</h3>
+        <p class="small mt1">Escape analysis fields are zeroed — EA recomputes cheaply during
+           the first C2 compilation. Avoids serialising highly implementation-specific state.</p>
+      </div>
+    </div>
+  </div>
+  <div class="slide-num">6</div>
+</div>
+
+<!-- ════════════════════════════════════════════════════════
+     SLIDE 7 — Implementation Scope
+     ════════════════════════════════════════════════════════ -->
+<div class="slide bg-accent">
+  <div>
+    <p class="subtitle"><span class="green">&#9679;</span> Implementation</p>
+    <h1>Files Modified &amp; Created</h1>
+    <table class="mt2">
+      <thead>
+        <tr><th>File</th><th>Role</th><th>Lines</th></tr>
+      </thead>
+      <tbody>
+        <tr><td class="mono" style="color:#7dd3fc">portableMDO.hpp</td><td>Format structs, API declarations, constants</td><td>~460</td></tr>
+        <tr><td class="mono" style="color:#7dd3fc">portableMDO.cpp</td><td>Full exporter + importer implementation</td><td>~2,245</td></tr>
+        <tr><td class="mono" style="color:#fde68a">globals.hpp</td><td>VM flags: ExportMDOFile, ImportMDOFile, MDOExportDeoptDecayPercent</td><td>+6</td></tr>
+        <tr><td class="mono" style="color:#fde68a">vmOperation.hpp</td><td>ExportMDO added to VM_OPS_DO table</td><td>+1</td></tr>
+        <tr><td class="mono" style="color:#86efac">java.cpp</td><td>before_exit hooks: export_on_shutdown + shutdown_import</td><td>+8</td></tr>
+        <tr><td class="mono" style="color:#86efac">threads.cpp</td><td>create_vm hook: initialize_import after class loaders</td><td>+4</td></tr>
+        <tr><td class="mono" style="color:#86efac">method.cpp</td><td>build_profiling_method_data: try_import before allocate</td><td>+12</td></tr>
+        <tr><td class="mono" style="color:#c4b5fd">test_portableMDO.cpp</td><td>26 GTest unit tests</td><td>~380</td></tr>
+        <tr><td class="mono" style="color:#c4b5fd">TestPortableMDORoundTrip.java</td><td>JTreg integration test</td><td>~148</td></tr>
+        <tr><td class="mono" style="color:#94a3b8">portable-mdo-design.md</td><td>Design document</td><td>~871</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="slide-num">7</div>
+</div>
+
+<!-- ════════════════════════════════════════════════════════
+     SLIDE 8 — Bug #1: Receiver Pointer Crash
+     ════════════════════════════════════════════════════════ -->
+<div class="slide bg-problem">
+  <div>
+    <p class="subtitle"><span class="red">&#9679;</span> Bug #1 — Crash</p>
+    <h1 class="red">SEGFAULT in KlassRefTableBuilder::add_or_discard</h1>
+    <div class="cols mt2">
+      <div>
+        <h3>Symptom</h3>
+        <pre><code>SIGSEGV in Symbol::utf8_length()
+  called from KlassRefTableBuilder::write_to
+  <span class="hl-red">e.name = (Symbol*)0xa  ← invalid pointer</span>
+
+Crash during MDO export at safepoint.
+The Klass* passed to add_or_discard was 0xa.</code></pre>
+        <h3 class="mt2">Root Cause</h3>
+        <p class="small"><code>ReceiverTypeData::receiver(row)</code> returns the <strong>raw cell value</strong>
+           cast to <code>Klass*</code>. It does NOT strip tag bits. The value <code>0xa</code> =
+           <code>null_seen(1) | type_unknown(2) | 0x8</code> — a tagged intptr from
+           TypeEntries, not a valid metaspace pointer.</p>
+      </div>
+      <div>
+        <h3>Fix</h3>
+        <pre><code>int16_t add_or_discard(const Klass* k) {
+  if (k == nullptr) return NULL_KLASS_REF;
+
+  <span class="hl-green">// Reject values that cannot be valid
+  // metaspace pointers</span>
+  <span class="hl-green">if ((uintptr_t)k < os::vm_page_size())</span>
+    <span class="hl-green">return NULL_KLASS_REF;</span>
+  <span class="hl-green">if ((uintptr_t)k & (alignof(Klass)-1))</span>
+    <span class="hl-green">return NULL_KLASS_REF;</span>
+
+  if (k->is_hidden()) ...  // now safe
+}</code></pre>
+        <div class="card card-green mt2">
+          <p class="small"><span class="green bold">Strategy:</span> Validate pointer alignment and
+             minimum address before any dereference. Sub-page-size values and
+             misaligned pointers are rejected as invalid.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="slide-num">8</div>
+</div>
+
+<!-- ════════════════════════════════════════════════════════
+     SLIDE 9 — Bug #2: ResourceMark Corruption
+     ════════════════════════════════════════════════════════ -->
+<div class="slide bg-problem">
+  <div>
+    <p class="subtitle"><span class="red">&#9679;</span> Bug #2 — Data Corruption</p>
+    <h1 class="red">Klass Ref Table Contains Garbage After Export</h1>
+    <div class="cols mt2">
+      <div>
+        <h3>Symptom</h3>
+        <pre><code>klass_ref[0] loader=96 name_len=1 name=''
+klass_ref[1] loader=160 name_len=1 name=''
+<span class="hl-red">// All klass names empty, loader tags garbage</span>
+<span class="hl-red">// Import lookup map finds no matches</span>
+
+Map insert: <span class="hl-red">.hotLoop(I)I</span>  ← missing class name!
+Lookup:     MDOWarmTest.hotLoop(I)I  ← never found</code></pre>
+        <h3 class="mt2">Root Cause</h3>
+        <p class="small">The <code>GrowableArray</code> backing the
+          <code>KlassRefTableBuilder</code> grew inside the inner <code>ResourceMark</code> of
+          <code>export_single_mdo()</code>. When that scope exited after each MDO, the ResourceArea
+          freed the array's backing memory. Subsequent reads returned garbage.</p>
+      </div>
+      <div>
+        <h3>Memory Lifecycle Diagram</h3>
+        <div style="display:flex;flex-direction:column;gap:3px;font-size:.78rem;font-family:'JetBrains Mono',monospace">
+          <div style="padding:.3rem .6rem;background:rgba(56,189,248,.1);border-radius:.25rem;color:#7dd3fc">export_all_to_file() {</div>
+          <div style="padding:.3rem .6rem;background:rgba(56,189,248,.06);border-radius:.25rem;color:#7dd3fc">&nbsp;&nbsp;ResourceMark rm;  // outer scope</div>
+          <div style="padding:.3rem .6rem;background:rgba(56,189,248,.06);border-radius:.25rem;color:#7dd3fc">&nbsp;&nbsp;KlassRefTableBuilder klass_table;</div>
+          <div style="padding:.3rem .6rem;background:rgba(56,189,248,.06);border-radius:.25rem;color:#7dd3fc">&nbsp;&nbsp;for each MDO:</div>
+          <div style="padding:.3rem .6rem;background:rgba(248,113,113,.12);border-radius:.25rem;color:#fca5a5">&nbsp;&nbsp;&nbsp;&nbsp;export_single_mdo() {</div>
+          <div style="padding:.3rem .6rem;background:rgba(248,113,113,.2);border-radius:.25rem;color:#fca5a5">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="hl-red">ResourceMark rm; // INNER!</span></div>
+          <div style="padding:.3rem .6rem;background:rgba(248,113,113,.12);border-radius:.25rem;color:#fca5a5">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;klass_table->add_or_discard(k);</div>
+          <div style="padding:.3rem .6rem;background:rgba(248,113,113,.2);border-radius:.25rem;color:#fca5a5">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="hl-red">// ~ResourceMark frees array memory!</span></div>
+          <div style="padding:.3rem .6rem;background:rgba(248,113,113,.12);border-radius:.25rem;color:#fca5a5">&nbsp;&nbsp;&nbsp;&nbsp;}</div>
+          <div style="padding:.3rem .6rem;background:rgba(248,113,113,.15);border-radius:.25rem;color:#fca5a5">&nbsp;&nbsp;klass_table.write_to()  <span class="hl-red">// reads freed memory!</span></div>
+        </div>
+        <div class="card card-green mt2">
+          <p class="small"><span class="green bold">Fix:</span> Remove inner <code>ResourceMark</code> from
+             <code>export_single_mdo()</code>. The outer ResourceMark in
+             <code>export_all_to_file()</code> covers the entire export lifecycle.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="slide-num">9</div>
+</div>
+
+<!-- ════════════════════════════════════════════════════════
+     SLIDE 10 — All Bugs Summary
+     ════════════════════════════════════════════════════════ -->
+<div class="slide bg-problem">
+  <div>
+    <p class="subtitle"><span class="red">&#9679;</span> All Issues Found</p>
+    <h1>6 Bugs Discovered &amp; Fixed</h1>
+    <table class="mt2">
+      <thead>
+        <tr><th>#</th><th>Category</th><th>Description</th><th>Phase</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="bold red">1</td>
+          <td><span class="tag tag-red">compile</span></td>
+          <td>Missing <code>#include</code> headers for SymbolTable, ClassLoaderData</td>
+          <td>Phase 1</td>
+        </tr>
+        <tr>
+          <td class="bold red">2</td>
+          <td><span class="tag tag-red">compile</span></td>
+          <td>Incorrect API usage: <code>cld->is_platform_class_loader_data()</code> method name</td>
+          <td>Phase 1</td>
+        </tr>
+        <tr>
+          <td class="bold red">3</td>
+          <td><span class="tag tag-red">compile</span></td>
+          <td>Template deduction failure in <code>ResourceHashtable</code> hash function signature</td>
+          <td>Phase 3</td>
+        </tr>
+        <tr>
+          <td class="bold red">4</td>
+          <td><span class="tag tag-red">compile</span></td>
+          <td>Wrong cast type in <code>MethodData</code> allocation from <code>ClassLoaderData</code></td>
+          <td>Phase 4</td>
+        </tr>
+        <tr>
+          <td class="bold yellow">5</td>
+          <td><span class="tag tag-yellow">crash</span></td>
+          <td>SEGFAULT: <code>ReceiverTypeData::receiver()</code> returns tagged intptr as Klass*</td>
+          <td>Runtime</td>
+        </tr>
+        <tr>
+          <td class="bold yellow">6</td>
+          <td><span class="tag tag-yellow">corruption</span></td>
+          <td>Inner <code>ResourceMark</code> in <code>export_single_mdo</code> frees GrowableArray memory</td>
+          <td>Runtime</td>
+        </tr>
+      </tbody>
+    </table>
+    <div class="cols mt2">
+      <div class="card card-blue">
+        <h3 class="accent">Compile-time (4)</h3>
+        <p class="small">Caught by <code>clang++ -fsyntax-only</code> iterative compilation.
+           All related to HotSpot internal API specifics — method names, template parameters, cast types.</p>
+      </div>
+      <div class="card card-red">
+        <h3 class="red">Runtime (2)</h3>
+        <p class="small">Required actual workload execution to surface. Both involved subtle
+           pointer/memory lifetime issues invisible at compile time. Found via systematic
+           hex dump analysis and diagnostic logging.</p>
+      </div>
+    </div>
+  </div>
+  <div class="slide-num">10</div>
+</div>
+
+<!-- ════════════════════════════════════════════════════════
+     SLIDE 11 — Debugging Methodology
+     ════════════════════════════════════════════════════════ -->
+<div class="slide bg-navy">
+  <div>
+    <p class="subtitle"><span class="orange">&#9679;</span> Methodology</p>
+    <h1>Debugging Deep HotSpot Runtime Bugs</h1>
+    <div class="cols mt2">
+      <div>
+        <h3 class="orange mb1">Techniques Used</h3>
+        <ul>
+          <li><span class="bold">Hex dump analysis</span> — <code>xxd</code> on the .mdo file to verify file format integrity at byte level</li>
+          <li><span class="bold">Offset correlation</span> — compared writer.position() vs ftell() to detect file position drift</li>
+          <li><span class="bold">Layered logging</span> — trace/info/debug log levels at critical export/import points</li>
+          <li><span class="bold">Pointer forensics</span> — decoded 0xa as TypeEntries tag bits (null_seen | type_unknown)</li>
+          <li><span class="bold">Memory lifecycle tracing</span> — tracked GrowableArray allocation across ResourceMark scopes</li>
+        </ul>
+      </div>
+      <div>
+        <h3 class="orange mb1">Debugging Timeline</h3>
+        <div style="display:flex;flex-direction:column;gap:6px;font-size:.85rem">
+          <div class="card" style="padding:.6rem 1rem">
+            <span class="yellow bold">1.</span> Export crashes with SIGSEGV at Klass* = 0xa
+          </div>
+          <div class="card" style="padding:.6rem 1rem">
+            <span class="yellow bold">2.</span> Traced 0xa to ReceiverTypeData raw cell tags
+          </div>
+          <div class="card" style="padding:.6rem 1rem">
+            <span class="green bold">3.</span> Fix: pointer validity check &#10004;
+          </div>
+          <div class="card" style="padding:.6rem 1rem">
+            <span class="yellow bold">4.</span> Export succeeds but import finds no methods
+          </div>
+          <div class="card" style="padding:.6rem 1rem">
+            <span class="yellow bold">5.</span> Klass ref table contains garbage names
+          </div>
+          <div class="card" style="padding:.6rem 1rem">
+            <span class="yellow bold">6.</span> Hex dump confirms corrupt data at correct offset
+          </div>
+          <div class="card" style="padding:.6rem 1rem">
+            <span class="yellow bold">7.</span> ftell == writer.position — offset is correct
+          </div>
+          <div class="card" style="padding:.6rem 1rem">
+            <span class="yellow bold">8.</span> Identified inner ResourceMark as the culprit
+          </div>
+          <div class="card" style="padding:.6rem 1rem">
+            <span class="green bold">9.</span> Fix: remove inner ResourceMark &#10004;
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="slide-num">11</div>
+</div>
+
+<!-- ════════════════════════════════════════════════════════
+     SLIDE 12 — End-to-End Results
+     ════════════════════════════════════════════════════════ -->
+<div class="slide bg-results">
+  <div>
+    <p class="subtitle"><span class="green">&#9679;</span> Results</p>
+    <h1>End-to-End Verification</h1>
+    <div class="cols mt2">
+      <div>
+        <h3 class="accent mb1">JVM 1: Export</h3>
+        <pre><code>$ java -XX:+UnlockDiagnosticVMOptions \
+       -XX:ExportMDOFile=/tmp/profile.mdo \
+       -XX:MDOExportDeoptDecayPercent=50 \
+       -Xlog:aot+training=info \
+       MDOWarmTest export
+
+<span class="hl-green">PortableMDO: exported 149 mature MDO profiles</span>
+  73 klass refs, 0 method refs
+  <span class="hl-blue">40,704 bytes</span></code></pre>
+
+        <h3 class="accent mb1 mt2">JVM 2: Import</h3>
+        <pre><code>$ java -XX:+UnlockDiagnosticVMOptions \
+       -XX:ImportMDOFile=/tmp/profile.mdo \
+       -Xlog:aot+training=info \
+       MDOWarmTest import
+
+<span class="hl-green">PortableMDO import: loaded 149 MDO profiles</span>
+<span class="hl-green">reconstructed MDO for MDOWarmTest.hotLoop</span>
+  (2 records, 0 extra, 0 params, 0 handlers)
+<span class="hl-green">reconstructed MDO for MDOWarmTest.branchProfile</span>
+  (1 records, 0 extra, 0 params, 0 handlers)
+<span class="hl-green">reconstructed MDO for MDOWarmTest.main</span>
+  (11 records, 0 extra, 0 params, 0 handlers)</code></pre>
+      </div>
+      <div>
+        <h3 class="green mb1">Verification Checks</h3>
+        <div style="display:flex;flex-direction:column;gap:.5rem">
+          <div class="card card-green" style="padding:.6rem 1rem">
+            <span class="green bold">&#10004;</span> File magic 0x4A4D444F correct
+          </div>
+          <div class="card card-green" style="padding:.6rem 1rem">
+            <span class="green bold">&#10004;</span> 149 MDO entries exported
+          </div>
+          <div class="card card-green" style="padding:.6rem 1rem">
+            <span class="green bold">&#10004;</span> 73 klass refs with correct names
+          </div>
+          <div class="card card-green" style="padding:.6rem 1rem">
+            <span class="green bold">&#10004;</span> All 149 profiles loaded in JVM 2
+          </div>
+          <div class="card card-green" style="padding:.6rem 1rem">
+            <span class="green bold">&#10004;</span> User methods reconstructed (hotLoop, branchProfile, main)
+          </div>
+          <div class="card card-green" style="padding:.6rem 1rem">
+            <span class="green bold">&#10004;</span> JDK system methods imported (HashMap, ArrayList, Double...)
+          </div>
+          <div class="card card-green" style="padding:.6rem 1rem">
+            <span class="green bold">&#10004;</span> Bytecode fingerprints validated
+          </div>
+          <div class="card card-green" style="padding:.6rem 1rem">
+            <span class="green bold">&#10004;</span> No crashes, no error logs
+          </div>
+          <div class="card card-green" style="padding:.6rem 1rem">
+            <span class="green bold">&#10004;</span> 0 compile errors, 0 warnings
+          </div>
+        </div>
+        <div class="card card-blue mt2">
+          <h3 class="accent">Warm State Captured</h3>
+          <p class="small">JVM 2 receives JVM 1's branch probabilities, loop iteration counts,
+             receiver type profiles, and deopt history — <strong>before executing a single bytecode</strong>
+             of the workload methods.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="slide-num">12</div>
+</div>
+
+<!-- ════════════════════════════════════════════════════════
+     SLIDE 13 — Testing
+     ════════════════════════════════════════════════════════ -->
+<div class="slide bg-navy">
+  <div>
+    <p class="subtitle"><span class="purple">&#9679;</span> Testing</p>
+    <h1>Test Coverage</h1>
+    <div class="cols mt2">
+      <div>
+        <h3 class="purple mb1">GTest Unit Tests (26 tests)</h3>
+        <ul>
+          <li>Struct layout verification — sizeof, alignment, field offsets for all 15+ format structs</li>
+          <li>Round-trip serialization — write/read PortableKlassRefEntry, PortableMethodRefEntry, PortableProfileRecordHeader</li>
+          <li>Enum value tests — PortableClassLoaderTag, PortableExtraTag</li>
+          <li>Header validation — magic number, format version, pointer size, endianness</li>
+          <li>Bytecode fingerprint — CRC32 computation on live Method* objects</li>
+          <li>Edge cases — MAX constants, NULL_KLASS_REF sentinel, padding zeroes</li>
+        </ul>
+      </div>
+      <div>
+        <h3 class="purple mb1">JTreg Integration Test</h3>
+        <div class="card card-purple">
+          <p class="small mono">TestPortableMDORoundTrip.java</p>
+          <ul class="mt1">
+            <li>Forks JVM 1 with workload + ExportMDOFile</li>
+            <li>Verifies .mdo file exists and has correct magic</li>
+            <li>Forks JVM 2 with ImportMDOFile</li>
+            <li>Verifies import success logs in stdout</li>
+            <li>Validates no crash or error in either JVM</li>
+          </ul>
+        </div>
+        <h3 class="purple mb1 mt2">Manual End-to-End</h3>
+        <div class="card card-purple">
+          <p class="small">Full workload test with <code>MDOWarmTest.java</code>:
+             hot loops, branch profiling, polymorphic calls.
+             Verified profile reconstruction in JVM 2 via
+             <code>-Xlog:aot+training=info</code>.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="slide-num">13</div>
+</div>
+
+<!-- ════════════════════════════════════════════════════════
+     SLIDE 14 — Profile Data Types
+     ════════════════════════════════════════════════════════ -->
+<div class="slide bg-accent">
+  <div>
+    <p class="subtitle"><span class="accent">&#9679;</span> Data Types</p>
+    <h1>Profile Data Serialized</h1>
+    <div class="cols-3 mt2">
+      <div class="card card-blue">
+        <h3 class="accent">Counters</h3>
+        <ul class="mt1">
+          <li>Invocation count</li>
+          <li>Backedge count</li>
+          <li>Per-BCI execution count</li>
+          <li>Branch taken / not-taken</li>
+          <li>Switch case counts</li>
+        </ul>
+      </div>
+      <div class="card card-green">
+        <h3 class="green">Type Profiles</h3>
+        <ul class="mt1">
+          <li>Receiver types (virtual calls)</li>
+          <li>Argument types (call type data)</li>
+          <li>Return types</li>
+          <li>Parameter types</li>
+          <li>Type conflict flags</li>
+        </ul>
+      </div>
+      <div class="card card-yellow">
+        <h3 class="yellow">Deoptimization</h3>
+        <ul class="mt1">
+          <li>Trap histogram per reason</li>
+          <li>Decompile count (with decay)</li>
+          <li>Overflow recompile count</li>
+          <li>Per-BCI trap state</li>
+          <li>Speculative trap records</li>
+        </ul>
+      </div>
+      <div class="card card-purple">
+        <h3 class="purple">Structure</h3>
+        <ul class="mt1">
+          <li>Number of loops</li>
+          <li>Number of blocks</li>
+          <li>Would-profile hint</li>
+          <li>Arg-modified flags</li>
+        </ul>
+      </div>
+      <div class="card card-orange">
+        <h3 class="orange">Control Flow</h3>
+        <ul class="mt1">
+          <li>Jump taken counts</li>
+          <li>Ret data targets</li>
+          <li>Exception handler coverage</li>
+          <li>Multi-branch default count</li>
+        </ul>
+      </div>
+      <div class="card card-red">
+        <h3 class="red">Intentionally Omitted</h3>
+        <ul class="red mt1">
+          <li>Escape analysis state</li>
+          <li>DataLayout displacements</li>
+          <li>Raw cell addresses</li>
+          <li>Hidden class references</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+  <div class="slide-num">14</div>
+</div>
+
+<!-- ════════════════════════════════════════════════════════
+     SLIDE 15 — Future Work & Conclusion
+     ════════════════════════════════════════════════════════ -->
+<div class="slide bg-dark">
+  <div>
+    <p class="subtitle"><span class="accent">&#9679;</span> Conclusion</p>
+    <h1>Summary &amp; Future Directions</h1>
+    <div class="cols mt2">
+      <div>
+        <h3 class="green mb1">What We Built</h3>
+        <ul class="green">
+          <li>Complete Portable MDO binary format specification</li>
+          <li>Full exporter: safepoint-safe, handles all 13 profile data types</li>
+          <li>Full importer: lazy on-demand reconstruction with fingerprint validation</li>
+          <li>JVM integration: 3 hook points (startup, method profiling, shutdown)</li>
+          <li>Comprehensive test suite: 26 gtests + jtreg + manual E2E</li>
+          <li>Found &amp; fixed 6 bugs including 2 deep runtime issues</li>
+        </ul>
+
+        <h3 class="yellow mb1 mt2">Key Metrics</h3>
+        <div style="display:flex;gap:1rem;flex-wrap:wrap">
+          <div class="card" style="padding:.5rem 1rem;text-align:center">
+            <div class="accent bold" style="font-size:1.8rem">2,700+</div>
+            <div class="small">lines of C++</div>
+          </div>
+          <div class="card" style="padding:.5rem 1rem;text-align:center">
+            <div class="green bold" style="font-size:1.8rem">149</div>
+            <div class="small">MDOs exported</div>
+          </div>
+          <div class="card" style="padding:.5rem 1rem;text-align:center">
+            <div class="purple bold" style="font-size:1.8rem">40 KB</div>
+            <div class="small">typical file size</div>
+          </div>
+          <div class="card" style="padding:.5rem 1rem;text-align:center">
+            <div class="yellow bold" style="font-size:1.8rem">0</div>
+            <div class="small">errors/warnings</div>
+          </div>
+        </div>
+      </div>
+      <div>
+        <h3 class="accent mb1">Future Work</h3>
+        <ul>
+          <li><span class="bold">Performance benchmarking</span> — measure actual warmup time reduction on real workloads (DaCapo, Renaissance)</li>
+          <li><span class="bold">CDS integration</span> — embed Portable MDO profiles alongside shared class data</li>
+          <li><span class="bold">WhiteBox API</span> — testing API for CI/CD validation of profile import quality</li>
+          <li><span class="bold">Counter normalization</span> — scale imported counters to match target JVM's compilation thresholds</li>
+          <li><span class="bold">Cross-version support</span> — profile migration across minor JDK updates</li>
+          <li><span class="bold">Partial import</span> — selective import of hot methods only, reducing memory pressure</li>
+        </ul>
+        <div class="card card-blue mt2">
+          <h3 class="accent">Impact</h3>
+          <p class="small">Portable MDO enables <strong>warm-start JVM deployments</strong> without requiring
+             shared filesystems, CDS archives, or identical memory layouts. Profile data
+             flows from production to staging, from CI to canary, from one container to the next.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="slide-num">15</div>
+</div>
+
+</div><!-- /deck -->
+
+<!-- Navigation -->
+<div class="nav">
+  <button onclick="prev()" id="btnPrev">&larr; Prev</button>
+  <span class="counter" id="counter">1 / 15</span>
+  <button onclick="next()" id="btnNext">Next &rarr;</button>
+</div>
+
+<script>
+const deck = document.getElementById('deck');
+const total = document.querySelectorAll('.slide').length;
+let current = 0;
+
+function go(n) {
+  current = Math.max(0, Math.min(total - 1, n));
+  deck.style.transform = `translateX(-${current * 100}vw)`;
+  document.getElementById('counter').textContent = `${current + 1} / ${total}`;
+}
+function next() { go(current + 1); }
+function prev() { go(current - 1); }
+
+document.addEventListener('keydown', e => {
+  if (e.key === 'ArrowRight' || e.key === ' ') { e.preventDefault(); next(); }
+  if (e.key === 'ArrowLeft') { e.preventDefault(); prev(); }
+  if (e.key === 'Home') { e.preventDefault(); go(0); }
+  if (e.key === 'End') { e.preventDefault(); go(total - 1); }
+});
+
+// Touch/swipe support
+let touchStartX = 0;
+document.addEventListener('touchstart', e => { touchStartX = e.changedTouches[0].screenX; });
+document.addEventListener('touchend', e => {
+  const diff = touchStartX - e.changedTouches[0].screenX;
+  if (Math.abs(diff) > 50) { diff > 0 ? next() : prev(); }
+});
+</script>
+
+</body>
+</html>
