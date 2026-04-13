@@ -1143,6 +1143,63 @@ static MDOLookupMap*           _import_lookup_map = nullptr;
 static bool                    _import_initialized = false;
 
 // --------------------------------------------------------------------------
+// Install-list — methods whose imported MDOs have been installed and are
+// ready to be eagerly compiled by the next drain.
+// --------------------------------------------------------------------------
+//
+// on_class_linked walks every method in a freshly-linked class. For each
+// method that matches an import entry it (a) installs the imported MDO and
+// (b) appends a record to this list. The list is consumed atomically by
+// eager_compile_imported_methods, which is invoked from Java via
+// VM.waitForEagerCompilation() at a controlled point after the application
+// has run enough work to link the methods we care about.
+//
+// Why a side list (instead of re-walking the import table at drain time)?
+//   - For BOOT/PLATFORM/APP holders we could resolve them by name from any
+//     thread, but for CUSTOM-loader holders (Spring's LaunchedURLClassLoader,
+//     Quarkus's runtime loader, DaCapo's bundled loader, etc.) we have no
+//     way to recover the live ClassLoader instance from a stored tag.
+//   - on_class_linked sees the InstanceKlass directly with whatever loader
+//     happened to load it, so the record we append carries a Method* that
+//     was acquired through the right loader by definition. The drain never
+//     needs to do a name lookup.
+//
+// Concurrency:
+//   - Many writers (any thread that links a class). Single reader (the
+//     drain). Lock-free push via Atomic::cmpxchg, lock-free take-all via
+//     Atomic::xchg.
+//
+// Method* lifetime:
+//   - We hold a raw Method*, not a methodHandle. If a class unloads
+//     between install and drain (rare in our use case — drain is called
+//     between request 1 and request 2), the drain skips records whose
+//     holder's ClassLoaderData is no longer alive.
+
+struct InstallRecord : public CHeapObj<mtInternal> {
+  Method* method;
+  uint8_t level;
+  InstallRecord* next;
+};
+
+static InstallRecord* volatile _install_list_head = nullptr;
+
+static void install_list_append(Method* m, uint8_t level) {
+  InstallRecord* rec = new InstallRecord();
+  rec->method = m;
+  rec->level = level;
+  // Lock-free push: spin on cmpxchg until we successfully link in.
+  InstallRecord* old_head;
+  do {
+    old_head = Atomic::load(&_install_list_head);
+    rec->next = old_head;
+  } while (Atomic::cmpxchg(&_install_list_head, old_head, rec) != old_head);
+}
+
+static InstallRecord* install_list_take_all() {
+  return Atomic::xchg(&_install_list_head, (InstallRecord*)nullptr);
+}
+
+// --------------------------------------------------------------------------
 // Header validation
 // --------------------------------------------------------------------------
 
@@ -2204,16 +2261,23 @@ MethodData* PortableMDO::try_import(const methodHandle& method, TRAPS) {
 // --------------------------------------------------------------------------
 //
 // Called from InstanceKlass::link_class_impl as soon as a class finishes
-// linking. This hook only INSTALLS imported MDOs — it never triggers
-// compilation. That keeps the path fully reentrant-safe: even if a future
-// drain compiles a method whose inlining causes more class loading, the
-// recursive on_class_linked just installs more MDOs (cheap, no locks
-// beyond the normal MDO allocation path).
+// linking. This hook installs imported MDOs and records each successfully-
+// installed method on the install-list for later eager compilation. It
+// never triggers compilation directly — that's the drain's job.
 //
-// Compilation is performed exclusively by eager_compile_imported_methods,
-// which is invoked from Java via jdk.internal.misc.VM.waitForEagerCompilation()
-// at a controlled point after the application has finished its initial
-// class-loading burst.
+// Why install-then-record (instead of compile inline)?
+//   - Compiling inline from link_class_impl means the compilation happens
+//     on whatever thread happened to load the class, often deep inside
+//     ClassLoader.loadClass paths where holding compile-broker locks would
+//     deadlock.
+//   - Recording to a side list lets us batch every method we care about
+//     and drain them from one well-known JavaThread (the one that calls
+//     VM.waitForEagerCompilation()).
+//
+// This path fires for ANY classloader — boot, platform, app, or custom.
+// Custom-loader holders (Spring, Quarkus, Lambda, DaCapo's bundled loader)
+// land on the install-list the same way as JDK classes. The drain compiles
+// them without ever needing to look the loader up by name.
 
 void PortableMDO::on_class_linked(InstanceKlass* klass, TRAPS) {
   if (!_import_initialized) return;
@@ -2234,6 +2298,27 @@ void PortableMDO::on_class_linked(InstanceKlass* klass, TRAPS) {
     int* entry_idx = _import_lookup_map->get(key);
     if (entry_idx == nullptr) continue;
 
+    ImportedMDOEntry* entry = &_import_entries[*entry_idx];
+
+    // Validate bytecode fingerprint before doing any work — if the method
+    // body has changed since export, the imported profile is stale and
+    // we shouldn't install it OR queue it for compilation.
+    uint32_t current_fp = PortableMDO::compute_bytecode_fingerprint(m);
+    if (current_fp != entry->bytecode_fingerprint) continue;
+
+    // Read the stored compilation level from the entry's header fields.
+    // We need this to know what tier to compile at during the drain.
+    PortableMDOReader hdr_reader(_import_buffer, _import_buffer_size);
+    hdr_reader.set_position(entry->header_fields_offset);
+    PortableMDOHeaderFields header_fields;
+    if (!hdr_reader.read_struct(&header_fields, sizeof(header_fields))) continue;
+
+    // Don't queue anything for level 0 (interpreted) — there's nothing
+    // to compile and CompileBroker would reject it anyway.
+    int level = (int)header_fields.highest_comp_level;
+    if (level <= CompLevel_none) continue;
+    if (level > CompLevel_full_optimization) level = CompLevel_full_optimization;
+
     // Force MDO creation which routes through try_import — pure
     // reconstruction, no compilation.
     if (m->method_data() == nullptr) {
@@ -2241,112 +2326,80 @@ void PortableMDO::on_class_linked(InstanceKlass* klass, TRAPS) {
       m->build_profiling_method_data(mh, THREAD);
       if (HAS_PENDING_EXCEPTION) { CLEAR_PENDING_EXCEPTION; }
     }
+    if (m->method_data() == nullptr) continue;
+
+    // Record on the install-list for the next drain to compile.
+    install_list_append(m, (uint8_t)level);
   }
 }
 
 // --------------------------------------------------------------------------
 // Public API: eager_compile_imported_methods
 // --------------------------------------------------------------------------
+//
+// Drains the install-list. For each (Method*, level) record produced by
+// on_class_linked, queues a CompileBroker compilation at the recorded
+// tier and waits for the compile queues to empty.
+//
+// This intentionally does NOT walk the import table directly. Anything
+// the application hasn't linked yet by the time the drain runs is, by
+// definition, not on the hot path of the work that's been done so far,
+// and the JIT will pick it up incrementally on demand. Trying to
+// pre-resolve from the import table only ever worked for boot/platform/
+// app holders anyway — it could never recover a custom-loader instance
+// from a stored tag — so the install-list is strictly more capable.
 
 void PortableMDO::eager_compile_imported_methods(TRAPS) {
   if (!_import_initialized) return;
   if (!UseCompiler || !CompilationPolicy::is_compilation_enabled()) return;
 
-  ResourceMark rm(THREAD);
+  // Atomically take the entire install-list. Any installs that happen
+  // after this point form the next list and are picked up by the next
+  // drain (or leak harmlessly if there is no next drain — they'll still
+  // tier up via the normal counter path).
+  InstallRecord* head = install_list_take_all();
+
   int compiled = 0;
-  int skipped = 0;
+  int skipped_dead = 0;
+  int skipped_no_mdo = 0;
 
-  log_info(aot, training)("PortableMDO: starting eager compilation of %d imported methods",
-           _import_entry_count);
+  while (head != nullptr) {
+    InstallRecord* rec = head;
+    head = head->next;
 
-  for (int i = 0; i < _import_entry_count; i++) {
-    ImportedMDOEntry* entry = &_import_entries[i];
+    Method* m = rec->method;
 
-    // Resolve the holder class
-    if (entry->klass_ref_index < 0 || entry->klass_ref_index >= _import_klass_ref_count) {
-      skipped++;
-      continue;
-    }
-    ImportedKlassRef* kref = &_import_klass_refs[entry->klass_ref_index];
-
-    // Skip custom classloader classes — we can't resolve them
-    if (kref->loader_tag == PortableClassLoaderTag::CUSTOM) {
-      skipped++;
-      continue;
-    }
-
-    // Use resolve_or_null to actually load the class if needed
-    Handle loader = classloader_handle_from_tag(kref->loader_tag, THREAD);
-    TempNewSymbol klass_sym = SymbolTable::new_symbol(kref->name->as_C_string(),
-                                                       (int)kref->name->utf8_length());
-    Klass* k = SystemDictionary::resolve_or_null(klass_sym, loader, THREAD);
-    if (HAS_PENDING_EXCEPTION) { CLEAR_PENDING_EXCEPTION; }
-    if (k == nullptr || !k->is_instance_klass()) {
-      skipped++;
+    // Liveness guard: if the holder's classloader has unloaded since the
+    // record was appended, m is dangling and we must not touch it.
+    InstanceKlass* holder = m->method_holder();
+    ClassLoaderData* cld = holder->class_loader_data();
+    if (cld == nullptr || !cld->is_alive()) {
+      skipped_dead++;
+      delete rec;
       continue;
     }
 
-    InstanceKlass* holder = InstanceKlass::cast(k);
-
-    // Link the class if not already linked
-    holder->link_class(THREAD);
-    if (HAS_PENDING_EXCEPTION) { CLEAR_PENDING_EXCEPTION; }
-
-    // Find the method
-    Method* target = holder->find_method(entry->method_name, entry->method_sig);
-    if (target == nullptr || target->is_abstract() || target->is_native()) {
-      skipped++;
+    if (m->method_data() == nullptr) {
+      // MDO install must have failed after we recorded — nothing to seed
+      // C2 with, so skip rather than compile blind.
+      skipped_no_mdo++;
+      delete rec;
       continue;
     }
 
-    // Validate bytecode fingerprint
-    uint32_t current_fp = PortableMDO::compute_bytecode_fingerprint(target);
-    if (current_fp != entry->bytecode_fingerprint) {
-      skipped++;
-      continue;
-    }
-
-    // Ensure the MDO is installed (via try_import path)
-    methodHandle mh(THREAD, target);
-    if (target->method_data() == nullptr) {
-      target->build_profiling_method_data(mh, THREAD);
-      if (HAS_PENDING_EXCEPTION) { CLEAR_PENDING_EXCEPTION; }
-    }
-
-    if (target->method_data() == nullptr) {
-      skipped++;
-      continue;
-    }
-
-    // Read the stored compilation level from the header fields
-    PortableMDOReader hdr_reader(_import_buffer, _import_buffer_size);
-    hdr_reader.set_position(entry->header_fields_offset);
-    PortableMDOHeaderFields header_fields;
-    if (!hdr_reader.read_struct(&header_fields, sizeof(header_fields))) {
-      skipped++;
-      continue;
-    }
-
-    CompLevel level = (CompLevel)header_fields.highest_comp_level;
-    if (level < CompLevel_none) {
-      level = CompLevel_none;
-    } else if (level > CompLevel_full_optimization) {
-      level = CompLevel_full_optimization;
-    }
-    // Don't eagerly compile at level 0 (interpreted) — no benefit
-    if (level <= CompLevel_none) {
-      skipped++;
-      continue;
-    }
-
-    // Queue the method for compilation
-    CompileBroker::compile_method(mh, InvocationEntryBci, level,
+    methodHandle mh(THREAD, m);
+    CompileBroker::compile_method(mh, InvocationEntryBci, (CompLevel)rec->level,
                                   0, CompileTask::Reason_MustBeCompiled, THREAD);
     if (HAS_PENDING_EXCEPTION) { CLEAR_PENDING_EXCEPTION; }
     compiled++;
+    delete rec;
   }
 
-  // Wait for all compilations to complete
+  log_info(aot, training)("PortableMDO: drain queued %d compilations "
+                          "(skipped %d dead, %d no-mdo)",
+                          compiled, skipped_dead, skipped_no_mdo);
+
+  // Wait for the compile queues to empty out before returning.
   for (;;) {
     CompileBroker::wait_for_no_active_tasks();
     CompileQueue* q1 = CompileBroker::c1_compile_queue();
@@ -2357,8 +2410,7 @@ void PortableMDO::eager_compile_imported_methods(TRAPS) {
     os::naked_short_sleep(1);
   }
 
-  log_info(aot, training)("PortableMDO: eager compilation done: %d compiled, %d skipped",
-           compiled, skipped);
+  log_info(aot, training)("PortableMDO: drain complete");
 }
 
 // --------------------------------------------------------------------------
@@ -2407,6 +2459,13 @@ void PortableMDO::shutdown_import() {
   if (_import_lookup_map != nullptr) {
     delete _import_lookup_map;
     _import_lookup_map = nullptr;
+  }
+  // Free any install-list records the drain didn't consume.
+  InstallRecord* leftover = install_list_take_all();
+  while (leftover != nullptr) {
+    InstallRecord* next = leftover->next;
+    delete leftover;
+    leftover = next;
   }
   _import_klass_ref_count = 0;
   _import_method_ref_count = 0;
