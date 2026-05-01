@@ -445,6 +445,25 @@ public class VM {
      */
     public static native String[] getRuntimeArguments();
 
+    /**
+     * Drains the HotSpot Portable MDO eager-compilation pipeline.
+     *
+     * <p>When the JVM was started with {@code -XX:ImportMDOFile=...} and
+     * {@code -XX:+EagerCompilePortableMDO}, imported {@code MethodData}
+     * profiles are installed lazily as their owning classes finish linking,
+     * but compilation is deferred. This method walks every imported entry,
+     * resolves and links its holder class, queues the recorded compilation
+     * level, and blocks until all compile queues drain.
+     *
+     * <p>Intended to be called from a framework or benchmark harness after
+     * the application's startup class-loading burst is over, so that the
+     * first measured workload runs with all profile-driven compilations
+     * already in place.
+     *
+     * <p>No-op when the relevant flags are not set.
+     */
+    public static native void waitForEagerCompilation();
+
     static {
         initialize();
     }

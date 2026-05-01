@@ -50,6 +50,8 @@ class ciEnv : StackObj {
   friend class Dependencies;  // for get_object, during logging
   friend class RecordLocation;
   friend class PrepareExtraDataClosure;
+  friend class MDOReplayDump; // allow helper to access private getters
+  friend class VM_DumpMDOReplay; // nested op helper
 
 private:
   Arena*           _arena;       // Alias for _ciEnv_arena except in init_shared_objects()

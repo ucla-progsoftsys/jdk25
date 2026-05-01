@@ -56,6 +56,7 @@
 #include "oops/klass.inline.hpp"
 #include "oops/method.inline.hpp"
 #include "oops/methodData.hpp"
+#include "oops/portableMDO.hpp"
 #include "oops/objArrayKlass.hpp"
 #include "oops/objArrayOop.inline.hpp"
 #include "oops/oop.inline.hpp"
@@ -638,6 +639,21 @@ void Method::build_profiling_method_data(const methodHandle& method, TRAPS) {
   if (install_training_method_data(method)) {
     return;
   }
+  // Try to import a pre-populated MDO from the portable MDO file.
+  if (PortableMDO::has_import_data()) {
+    MethodData* imported = PortableMDO::try_import(method, THREAD);
+    if (HAS_PENDING_EXCEPTION) {
+      CLEAR_PENDING_EXCEPTION;
+    }
+    if (imported != nullptr) {
+      if (!Atomic::replace_if_null(&method->_method_data, imported)) {
+        ClassLoaderData* ld = method->method_holder()->class_loader_data();
+        MetadataFactory::free_metadata(ld, imported);
+      }
+      return;
+    }
+  }
+
   // Do not profile the method if metaspace has hit an OOM previously
   // allocating profiling data. Callers clear pending exception so don't
   // add one here.

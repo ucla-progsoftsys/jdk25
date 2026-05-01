@@ -117,7 +117,8 @@
   template(RendezvousGCThreads)                   \
   template(JFRInitializeCPUTimeSampler)       \
   template(JFRTerminateCPUTimeSampler)        \
-  template(ReinitializeMDO)
+  template(ReinitializeMDO)                       \
+  template(ExportMDO)
 
 class Thread;
 class outputStream;

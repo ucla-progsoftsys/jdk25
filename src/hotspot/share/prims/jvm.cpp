@@ -61,6 +61,7 @@
 #include "oops/instanceKlass.hpp"
 #include "oops/klass.inline.hpp"
 #include "oops/method.hpp"
+#include "oops/portableMDO.hpp"
 #include "oops/recordComponent.hpp"
 #include "oops/objArrayKlass.hpp"
 #include "oops/objArrayOop.inline.hpp"
@@ -93,9 +94,11 @@
 #include "runtime/threadSMR.hpp"
 #include "runtime/vframe.inline.hpp"
 #include "runtime/vmOperations.hpp"
+#include "runtime/vmThread.hpp"
 #include "runtime/vm_version.hpp"
 #include "services/attachListener.hpp"
 #include "services/management.hpp"
+#include "services/profileCheckpoint.hpp"
 #include "services/threadService.hpp"
 #include "utilities/checkedCast.hpp"
 #include "utilities/copy.hpp"
@@ -3625,6 +3628,55 @@ JVM_ENTRY(jobject, JVM_InitAgentProperties(JNIEnv *env, jobject properties))
   return properties;
 JVM_END
 
+JVM_ENTRY(void, JVM_ProfileCheckpointDump(JNIEnv* env, jstring path))
+  if (path == nullptr) {
+    THROW(vmSymbols::java_lang_NullPointerException());
+  }
+
+  ResourceMark rm(THREAD);
+  Handle hpath(THREAD, JNIHandles::resolve_non_null(path));
+  const char* path_utf8 = java_lang_String::as_utf8_string(hpath());
+
+  fileStream fs(path_utf8, "wb");
+  if (!fs.is_open()) {
+    THROW_MSG(vmSymbols::java_io_IOException(), err_msg("Failed to open profile checkpoint dump file: %s", path_utf8));
+  }
+
+  // Run at a safepoint to avoid concurrent MDO mutations during dump.
+  class VM_ProfileCheckpointDump : public VM_Operation {
+    fileStream* _out;
+   public:
+    explicit VM_ProfileCheckpointDump(fileStream* out) : _out(out) {}
+    virtual VMOp_Type type() const { return VMOp_GC_HeapInspection; }
+    virtual void doit() { ProfileCheckpoint::dump_to_stream(_out); }
+  } op(&fs);
+
+  VMThread::execute(&op);
+JVM_END
+
+JVM_ENTRY(void, JVM_ProfileCheckpointLoad(JNIEnv* env, jstring path))
+  if (path == nullptr) {
+    THROW(vmSymbols::java_lang_NullPointerException());
+  }
+
+  ResourceMark rm(THREAD);
+  Handle hpath(THREAD, JNIHandles::resolve_non_null(path));
+  const char* path_utf8 = java_lang_String::as_utf8_string(hpath());
+
+  ProfileCheckpoint::Loader loader(THREAD);
+  ProfileCheckpoint::Loader::LoadResult res = loader.load_from_file(path_utf8);
+  if (res.status != ProfileCheckpoint::Loader::LoadStatus::Success) {
+    const char* status = ProfileCheckpoint::Loader::load_status_name(res.status);
+    THROW_MSG(vmSymbols::java_io_IOException(),
+              err_msg("Failed to load profile checkpoint (%s): %s", status, path_utf8));
+  }
+
+  // Preserve existing behavior for "eager compile after load" when enabled.
+  if (EagerCompileAfterLoad) {
+    ProfileCheckpoint::wait_for_compile_completion(THREAD);
+  }
+JVM_END
+
 JVM_ENTRY(jobjectArray, JVM_GetEnclosingMethodInfo(JNIEnv *env, jclass ofClass))
 {
   JvmtiVMObjectAllocEventCollector oam;
@@ -3665,6 +3717,13 @@ JVM_ENTRY(jobjectArray, JVM_GetEnclosingMethodInfo(JNIEnv *env, jclass ofClass))
   }
   return (jobjectArray) JNIHandles::make_local(THREAD, dest());
 }
+JVM_END
+
+// Drain entrypoint for the Portable MDO eager-compilation pipeline.
+// Called from jdk.internal.misc.VM.waitForEagerCompilation() — see
+// PortableMDO::eager_compile_imported_methods for behavior.
+JVM_ENTRY(void, JVM_WaitForEagerCompilation(JNIEnv *env, jclass ignored))
+  PortableMDO::eager_compile_imported_methods(THREAD);
 JVM_END
 
 // Returns an array of java.lang.String objects containing the input arguments to the VM.

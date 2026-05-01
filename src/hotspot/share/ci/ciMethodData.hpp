@@ -370,6 +370,7 @@ public:
 class ciMethodData : public ciMetadata {
   CI_PACKAGE_ACCESS
   friend class ciReplay;
+  friend class MDOReplayDump;
 
 private:
   // Size in bytes

@@ -93,6 +93,7 @@
 #include "utilities/events.hpp"
 #include "utilities/macros.hpp"
 #include "utilities/vmError.hpp"
+#include "services/profileCheckpoint.hpp"
 #if INCLUDE_JVMCI
 #include "jvmci/jvmciCompiler.hpp"
 #endif
@@ -3619,6 +3620,9 @@ static jint JNI_CreateJavaVM_inner(JavaVM **vm, void **penv, void *args) {
     JFR_ONLY(Jfr::on_thread_start(thread);)
 
     if (ReplayCompiles) ciReplay::replay(thread);
+    if (LoadMDOAtStartup && MDOReplayLoadFile != nullptr) {
+      ProfileCheckpoint::load(thread);
+    }
 
 #ifdef ASSERT
     // Some platforms (like Win*) need a wrapper around these test

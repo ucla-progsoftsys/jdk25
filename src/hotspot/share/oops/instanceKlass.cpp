@@ -70,6 +70,7 @@
 #include "oops/instanceStackChunkKlass.hpp"
 #include "oops/klass.inline.hpp"
 #include "oops/method.hpp"
+#include "oops/portableMDO.hpp"
 #include "oops/oop.inline.hpp"
 #include "oops/recordComponent.hpp"
 #include "oops/symbol.hpp"
@@ -1057,6 +1058,16 @@ bool InstanceKlass::link_class_impl(TRAPS) {
       }
     }
   }
+
+  // Proactively install imported MDO profiles and queue eager compilation
+  // for methods in this class, now that linking is complete.
+  // Must be outside the ObjectLocker scope — reconstruct_mdo may trigger
+  // class resolution which could need to acquire other init locks.
+  if (is_linked()) {
+    PortableMDO::on_class_linked(this, THREAD);
+    if (HAS_PENDING_EXCEPTION) { CLEAR_PENDING_EXCEPTION; }
+  }
+
   return true;
 }
 

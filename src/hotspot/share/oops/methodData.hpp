@@ -2247,6 +2247,27 @@ private:
   DataLayout* exception_handler_bci_to_data_helper(int bci);
 
 public:
+  struct HeaderSnapshot {
+    CompilerCounters _compiler_counters;
+    InvocationCounter _invocation_counter;
+    InvocationCounter _backedge_counter;
+    int               _invocation_counter_start;
+    int               _backedge_counter_start;
+    uint              _tenure_traps;
+    int               _invoke_mask;
+    int               _backedge_mask;
+    short             _num_loops;
+    short             _num_blocks;
+    WouldProfile      _would_profile;
+    intx              _eflags;
+    intx              _arg_local;
+    intx              _arg_stack;
+    intx              _arg_returned;
+    int               _data_size;
+    int               _parameters_type_data_di;
+    int               _exception_handler_data_di;
+  };
+  
   void clean_extra_data(CleanExtraDataClosure* cl);
 
   static int header_size() {
@@ -2307,6 +2328,9 @@ public:
 
   InvocationCounter* invocation_counter()     { return &_invocation_counter; }
   InvocationCounter* backedge_counter()       { return &_backedge_counter;   }
+
+  void snapshot_header(HeaderSnapshot* dst) const;
+  bool restore_header(const HeaderSnapshot& src);
 
 #if INCLUDE_JVMCI
   FailedSpeculation** get_failed_speculations_address() {

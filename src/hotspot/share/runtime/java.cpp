@@ -58,6 +58,7 @@
 #include "oops/method.inline.hpp"
 #include "oops/objArrayOop.hpp"
 #include "oops/oop.inline.hpp"
+#include "oops/portableMDO.hpp"
 #include "oops/symbol.hpp"
 #include "prims/jvmtiAgentList.hpp"
 #include "prims/jvmtiExport.hpp"
@@ -84,6 +85,8 @@
 #include "utilities/globalDefinitions.hpp"
 #include "utilities/macros.hpp"
 #include "utilities/vmError.hpp"
+#include "nmt/memTag.hpp"
+#include "services/profileCheckpoint.hpp"
 #ifdef COMPILER1
 #include "c1/c1_Compiler.hpp"
 #include "c1/c1_Runtime1.hpp"
@@ -102,6 +105,13 @@
 #endif
 
 GrowableArray<Method*>* collected_profiled_methods;
+static GrowableArray<Method*>* collected_all_methods;
+
+static void collect_all_methods(Method* m) {
+  if (m != nullptr && m->method_data() != nullptr) {
+    collected_all_methods->push(m);
+  }
+}
 
 static int compare_methods(Method** a, Method** b) {
   // compiled_invocation_count() returns int64_t, forcing the entire expression
@@ -295,6 +305,27 @@ void print_statistics() {
 
   print_method_profiling_data();
 
+  // Binary MDO replay dumper: write MDOX file at exit
+  if (DumpMDOAtExit && MDOReplayDumpFile != nullptr) {
+    log_info(compilation)("MDO replay: will dump profiles to %s", MDOReplayDumpFile);
+    fileStream fs(MDOReplayDumpFile, "wb");
+    if (fs.is_open()) {
+      // Run at a safepoint to avoid concurrent MDO mutations during dump
+      class VM_MDOReplayDump : public VM_Operation {
+        fileStream* _out;
+       public:
+        VM_MDOReplayDump(fileStream* out) : _out(out) {}
+        virtual VMOp_Type type() const { return VMOp_GC_HeapInspection; }
+        virtual void doit() {
+          ProfileCheckpoint::dump_to_stream(_out);
+        }
+      } op(&fs);
+      VMThread::execute(&op);
+    } else {
+      log_info(compilation)("MDO replay: failed to open %s", MDOReplayDumpFile);
+    }
+  }
+
   if (TimeOopMap) {
     GenerateOopMap::print_time();
   }
@@ -451,6 +482,12 @@ void before_exit(JavaThread* thread, bool halt) {
     MetaspaceShared::preload_and_dump(thread);
   }
 #endif
+
+  // Export MDO profiles if requested (must happen while metadata is alive)
+  PortableMDO::export_on_shutdown();
+
+  // Release portable MDO import resources (symbol refcounts, C-heap buffers)
+  PortableMDO::shutdown_import();
 
   // Hang forever on exit if we're reporting an error.
   if (ShowMessageBoxOnError && VMError::is_error_reported()) {

@@ -60,6 +60,7 @@
 #include "oops/instanceKlass.hpp"
 #include "oops/klass.inline.hpp"
 #include "oops/oop.inline.hpp"
+#include "oops/portableMDO.hpp"
 #include "oops/symbol.hpp"
 #include "prims/jvm_misc.hpp"
 #include "prims/jvmtiAgentList.hpp"
@@ -815,6 +816,11 @@ jint Threads::create_vm(JavaVMInitArgs* args, bool* canTryAgain) {
   // Initiate replay training processing once preloading is over.
   CompileBroker::init_training_replay();
 
+  // Initialize portable MDO import if requested (needs system/platform loaders cached)
+  // Note: when EagerCompilePortableMDO is set, on_class_linked() handles
+  // proactive MDO installation and compilation as each class is linked.
+  PortableMDO::initialize_import(ImportMDOFile);
+
   AOTLinkedClassBulkLoader::replay_training_at_init_for_preloaded_classes(CHECK_JNI_ERR);
 
   if (Continuations::enabled()) {
@@ -868,6 +874,9 @@ jint Threads::create_vm(JavaVMInitArgs* args, bool* canTryAgain) {
 
   if (UsePerfData)         PerfDataManager::create_misc_perfdata();
   if (CheckJNICalls)                  JniPeriodicChecker::engage();
+
+  // Profiles-only replay loader (stub): log intent at startup
+  // MDO replay logging moved to JNI_CreateJavaVM_inner.
 
   call_postVMInitHook(THREAD);
   // The Java side of PostVMInitHook.run must deal with all

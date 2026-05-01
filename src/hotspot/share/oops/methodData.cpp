@@ -1664,6 +1664,56 @@ void MethodData::print_data_on(outputStream* st) const {
   }
 }
 
+void MethodData::snapshot_header(HeaderSnapshot* dst) const {
+  assert(dst != nullptr, "must be");
+  Copy::conjoint_jbytes((const char*)&_compiler_counters,
+                        (char*)&dst->_compiler_counters,
+                        sizeof(CompilerCounters));
+  dst->_invocation_counter = _invocation_counter;
+  dst->_backedge_counter = _backedge_counter;
+  dst->_invocation_counter_start = _invocation_counter_start;
+  dst->_backedge_counter_start = _backedge_counter_start;
+  dst->_tenure_traps = _tenure_traps;
+  dst->_invoke_mask = _invoke_mask;
+  dst->_backedge_mask = _backedge_mask;
+  dst->_num_loops = _num_loops;
+  dst->_num_blocks = _num_blocks;
+  dst->_would_profile = _would_profile;
+  dst->_eflags = _eflags;
+  dst->_arg_local = _arg_local;
+  dst->_arg_stack = _arg_stack;
+  dst->_arg_returned = _arg_returned;
+  dst->_data_size = _data_size;
+  dst->_parameters_type_data_di = _parameters_type_data_di;
+  dst->_exception_handler_data_di = _exception_handler_data_di;
+}
+
+bool MethodData::restore_header(const HeaderSnapshot& src) {
+  if (_data_size != src._data_size ||
+      _parameters_type_data_di != src._parameters_type_data_di ||
+      _exception_handler_data_di != src._exception_handler_data_di) {
+    return false;
+  }
+  Copy::conjoint_jbytes((const char*)&src._compiler_counters,
+                        (char*)&_compiler_counters,
+                        sizeof(CompilerCounters));
+  _invocation_counter = src._invocation_counter;
+  _backedge_counter = src._backedge_counter;
+  _invocation_counter_start = src._invocation_counter_start;
+  _backedge_counter_start = src._backedge_counter_start;
+  _tenure_traps = src._tenure_traps;
+  _invoke_mask = src._invoke_mask;
+  _backedge_mask = src._backedge_mask;
+  _num_loops = src._num_loops;
+  _num_blocks = src._num_blocks;
+  _would_profile = src._would_profile;
+  _eflags = src._eflags;
+  _arg_local = src._arg_local;
+  _arg_stack = src._arg_stack;
+  _arg_returned = src._arg_returned;
+  return true;
+}
+
 // Verification
 
 void MethodData::verify_on(outputStream* st) {

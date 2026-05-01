@@ -1,0 +1,1191 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Portable MDO: Cross-JVM Profile Data Transfer for OpenJDK</title>
+<style>
+/* -- Reset & base -- */
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{height:100%;overflow:hidden;font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:#0f172a;color:#e2e8f0}
+
+/* -- Slide deck engine -- */
+.deck{display:flex;transition:transform .5s cubic-bezier(.4,0,.2,1);height:100%;width:100%}
+.slide{min-width:100vw;min-height:100vh;display:flex;flex-direction:column;justify-content:center;padding:3rem 6rem;position:relative;overflow-y:auto}
+
+/* -- Theme colours -- */
+.bg-dark{background:#0f172a}
+.bg-navy{background:linear-gradient(135deg,#0f172a 0%,#1e293b 100%)}
+.bg-accent{background:linear-gradient(135deg,#1e3a5f 0%,#0f172a 100%)}
+.bg-problem{background:linear-gradient(135deg,#3b0a0a 0%,#1a0505 100%)}
+.bg-fix{background:linear-gradient(135deg,#052e16 0%,#0a1f0f 100%)}
+.bg-results{background:linear-gradient(135deg,#1e1b4b 0%,#0f172a 100%)}
+
+/* -- Typography -- */
+h1{font-size:2.8rem;font-weight:800;line-height:1.15;margin-bottom:1rem;letter-spacing:-.02em}
+h2{font-size:2rem;font-weight:700;margin-bottom:.75rem;letter-spacing:-.01em}
+h3{font-size:1.35rem;font-weight:600;margin-bottom:.5rem}
+p,.desc{font-size:1.05rem;line-height:1.7;color:#94a3b8;max-width:58rem}
+.subtitle{font-size:1.25rem;color:#64748b;margin-bottom:1.5rem}
+.small{font-size:.85rem;color:#64748b}
+.accent{color:#38bdf8}
+.green{color:#4ade80}
+.red{color:#f87171}
+.yellow{color:#fbbf24}
+.orange{color:#fb923c}
+.purple{color:#a78bfa}
+.bold{font-weight:700}
+.mono{font-family:'JetBrains Mono','Fira Code','SF Mono',monospace}
+
+/* -- Layout helpers -- */
+.cols{display:grid;grid-template-columns:1fr 1fr;gap:2.5rem;margin-top:1.5rem}
+.cols-3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:2rem;margin-top:1.5rem}
+.cols-4{display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:1.5rem;margin-top:1.5rem}
+.mt1{margin-top:1rem}.mt2{margin-top:2rem}.mt3{margin-top:3rem}
+.mb1{margin-bottom:1rem}.mb2{margin-bottom:2rem}
+.gap1{gap:1rem}
+
+/* -- Cards -- */
+.card{background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);border-radius:.75rem;padding:1.25rem 1.5rem}
+.card-red{border-left:4px solid #f87171}
+.card-green{border-left:4px solid #4ade80}
+.card-blue{border-left:4px solid #38bdf8}
+.card-yellow{border-left:4px solid #fbbf24}
+.card-purple{border-left:4px solid #a78bfa}
+.card-orange{border-left:4px solid #fb923c}
+
+/* -- Code blocks -- */
+pre{background:rgba(0,0,0,.45);border:1px solid rgba(255,255,255,.08);border-radius:.5rem;padding:1rem 1.25rem;font-size:.82rem;line-height:1.6;overflow-x:auto;font-family:'JetBrains Mono','Fira Code','SF Mono',monospace;color:#cbd5e1}
+code{font-family:inherit}
+.hl-red{color:#fca5a5;font-weight:600}
+.hl-green{color:#86efac;font-weight:600}
+.hl-blue{color:#93c5fd;font-weight:600}
+.hl-yellow{color:#fde68a;font-weight:600}
+
+/* -- Diagrams (CSS-drawn) -- */
+.diagram{display:flex;align-items:center;justify-content:center;gap:1rem;margin:1.5rem 0;flex-wrap:wrap}
+.box{padding:.75rem 1.25rem;border-radius:.5rem;font-size:.9rem;font-weight:600;text-align:center;white-space:nowrap}
+.box-blue{background:rgba(56,189,248,.15);border:1px solid rgba(56,189,248,.4);color:#7dd3fc}
+.box-green{background:rgba(74,222,128,.15);border:1px solid rgba(74,222,128,.4);color:#86efac}
+.box-red{background:rgba(248,113,113,.15);border:1px solid rgba(248,113,113,.4);color:#fca5a5}
+.box-purple{background:rgba(167,139,250,.15);border:1px solid rgba(167,139,250,.4);color:#c4b5fd}
+.box-yellow{background:rgba(251,191,36,.15);border:1px solid rgba(251,191,36,.4);color:#fde68a}
+.box-gray{background:rgba(148,163,184,.1);border:1px solid rgba(148,163,184,.25);color:#94a3b8}
+.arrow{font-size:1.5rem;color:#475569}
+.arrow-down{font-size:1.3rem;color:#475569;text-align:center;margin:.25rem 0}
+
+/* -- Bullet lists -- */
+ul{list-style:none;padding-left:0}
+ul li{position:relative;padding-left:1.5rem;margin-bottom:.5rem;font-size:1rem;line-height:1.6;color:#94a3b8}
+ul li::before{content:'';position:absolute;left:0;top:.55rem;width:.45rem;height:.45rem;border-radius:50%;background:#38bdf8}
+ul.red li::before{background:#f87171}
+ul.green li::before{background:#4ade80}
+ul.yellow li::before{background:#fbbf24}
+
+/* -- Table -- */
+table{border-collapse:collapse;width:100%;margin-top:1rem;font-size:.95rem}
+th{text-align:left;padding:.6rem 1rem;background:rgba(255,255,255,.06);color:#e2e8f0;font-weight:600;border-bottom:2px solid rgba(255,255,255,.1)}
+td{padding:.55rem 1rem;border-bottom:1px solid rgba(255,255,255,.05);color:#94a3b8}
+
+/* -- Slide counter -- */
+.slide-num{position:absolute;bottom:1.5rem;right:2rem;font-size:.8rem;color:#475569}
+.tag{display:inline-block;font-size:.7rem;font-weight:600;padding:.2rem .6rem;border-radius:9999px;text-transform:uppercase;letter-spacing:.05em}
+.tag-red{background:rgba(248,113,113,.15);color:#fca5a5}
+.tag-green{background:rgba(74,222,128,.15);color:#86efac}
+.tag-blue{background:rgba(56,189,248,.15);color:#7dd3fc}
+.tag-yellow{background:rgba(251,191,36,.15);color:#fde68a}
+
+/* -- File layout diagram -- */
+.file-layout{display:flex;flex-direction:column;gap:2px;width:22rem;font-size:.8rem;font-family:'JetBrains Mono',monospace}
+.file-row{display:flex;align-items:center;padding:.4rem .8rem;border-radius:.25rem}
+.file-offset{width:4.5rem;color:#64748b;flex-shrink:0}
+.file-label{flex:1;font-weight:600}
+
+/* -- Bar chart -- */
+.bar-chart{display:flex;flex-direction:column;gap:.5rem;margin-top:1rem}
+.bar-row{display:flex;align-items:center;gap:.75rem;font-size:.85rem}
+.bar-label{width:6rem;text-align:right;color:#94a3b8;font-weight:600;flex-shrink:0}
+.bar-track{flex:1;height:1.6rem;background:rgba(255,255,255,.04);border-radius:.25rem;overflow:hidden;position:relative}
+.bar-fill{height:100%;border-radius:.25rem;display:flex;align-items:center;padding-left:.5rem;font-size:.75rem;font-weight:600;color:#fff;white-space:nowrap}
+.bar-cold{background:linear-gradient(90deg,#f87171,#dc2626)}
+.bar-warm{background:linear-gradient(90deg,#4ade80,#16a34a)}
+.bar-value{position:absolute;right:.5rem;top:50%;transform:translateY(-50%);font-size:.75rem;color:#94a3b8}
+
+/* -- Sparkline -- */
+.sparkline{display:flex;align-items:flex-end;gap:2px;height:3rem;margin-top:.5rem}
+.spark-bar{flex:1;border-radius:2px 2px 0 0;min-width:4px}
+
+/* -- Navigation -- */
+.nav{position:fixed;bottom:1.5rem;left:50%;transform:translateX(-50%);display:flex;gap:.75rem;z-index:100}
+.nav button{background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.12);color:#94a3b8;padding:.45rem 1rem;border-radius:.5rem;cursor:pointer;font-size:.85rem;transition:all .2s}
+.nav button:hover{background:rgba(255,255,255,.15);color:#e2e8f0}
+.nav .counter{padding:.45rem .75rem;color:#475569;font-size:.85rem;font-family:'JetBrains Mono',monospace}
+
+/* -- Highlight animation -- */
+@keyframes fadeInUp{from{opacity:0;transform:translateY(1rem)}to{opacity:1;transform:translateY(0)}}
+.slide.active *{animation:fadeInUp .5s ease both}
+
+/* -- Big stat -- */
+.big-stat{text-align:center;padding:1rem}
+.big-stat .num{font-size:2.5rem;font-weight:800;line-height:1}
+.big-stat .label{font-size:.8rem;color:#64748b;margin-top:.25rem}
+</style>
+</head>
+<body>
+
+<div class="deck" id="deck">
+
+<!-- ================================================================
+     SLIDE 1 -- Title
+     ================================================================ -->
+<div class="slide bg-dark">
+  <div>
+    <p class="subtitle mono" style="color:#38bdf8">OpenJDK 25 &middot; HotSpot Runtime</p>
+    <h1 style="font-size:3.2rem">Portable MDO<br><span style="color:#38bdf8">Cross-JVM Profile Transfer &amp; Eager Compilation</span></h1>
+    <p class="mt2" style="max-width:48rem">
+      A system for <span class="accent bold">exporting</span> JIT profiling data (MethodData objects) from one JVM,
+      <span class="green bold">importing</span> them into another, and <span class="yellow bold">eagerly compiling</span>
+      at the recorded tier &mdash; eliminating warm-up across JVM instances.
+    </p>
+    <div class="mt3" style="display:flex;gap:1rem;flex-wrap:wrap">
+      <span class="tag tag-blue">~2,700 lines C++</span>
+      <span class="tag tag-green">Eager compile pipeline</span>
+      <span class="tag tag-yellow">Lock-free install-list</span>
+      <span class="tag tag-red">DaCapo benchmarks</span>
+    </div>
+    <p class="mt2 small">Daniel Zhou &middot; April 2026</p>
+  </div>
+  <div class="slide-num">1</div>
+</div>
+
+<!-- ================================================================
+     SLIDE 2 -- Problem Statement
+     ================================================================ -->
+<div class="slide bg-navy">
+  <div>
+    <p class="subtitle"><span class="yellow">&#9679;</span> The Problem</p>
+    <h1>JVM Warm-up Is Expensive</h1>
+    <div class="cols mt2">
+      <div>
+        <p>Every JVM instance starts <span class="bold accent">cold</span>. The tiered compilation system
+           must re-discover hot methods and re-collect profiling data from scratch.</p>
+        <ul class="mt2">
+          <li>Interpreter &rarr; C1 (profiling) &rarr; C2 (optimized) takes <span class="bold">many iterations</span></li>
+          <li>Receiver type profiles, branch ratios, and trap history are empty</li>
+          <li>C2 can't devirtualize or speculate without profile data</li>
+          <li>Serverless cold starts pay this cost on <span class="bold">every container spawn</span></li>
+        </ul>
+      </div>
+      <div>
+        <div class="card card-yellow">
+          <h3 class="yellow">The Warm-up Ramp</h3>
+          <p class="small mt1">Example: DaCapo h2 benchmark takes <span class="bold">7 iterations</span> to reach steady-state
+             performance. Each early iteration runs 2&ndash;5x slower than optimal.</p>
+          <div class="bar-chart mt1">
+            <div class="bar-row"><span class="bar-label">Iter 1</span><div class="bar-track"><div class="bar-fill bar-cold" style="width:100%">118ms</div></div></div>
+            <div class="bar-row"><span class="bar-label">Iter 2</span><div class="bar-track"><div class="bar-fill bar-cold" style="width:58%">68ms</div></div></div>
+            <div class="bar-row"><span class="bar-label">Iter 4</span><div class="bar-track"><div class="bar-fill bar-cold" style="width:39%">46ms</div></div></div>
+            <div class="bar-row"><span class="bar-label">Iter 7</span><div class="bar-track"><div class="bar-fill bar-warm" style="width:24%">28ms</div></div></div>
+            <div class="bar-row"><span class="bar-label">Iter 10</span><div class="bar-track"><div class="bar-fill bar-warm" style="width:20%">24ms</div></div></div>
+          </div>
+        </div>
+        <div class="card card-red mt1">
+          <p class="small"><span class="red bold">Gap:</span> CDS and Leyden cache class data and compiled code, but
+            <span class="bold">not the profiling metadata</span> that <em>guides</em> C2 speculative optimizations.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="slide-num">2</div>
+</div>
+
+<!-- ================================================================
+     SLIDE 3 -- Solution Overview
+     ================================================================ -->
+<div class="slide bg-accent">
+  <div>
+    <p class="subtitle"><span class="green">&#9679;</span> Our Solution</p>
+    <h1>Portable MDO: Export &rarr; Import &rarr; Eager Compile</h1>
+    <p class="mt1">A three-phase system that captures a JVM's <span class="accent bold">profiling state</span>,
+       restores it into a fresh JVM, and <span class="yellow bold">immediately compiles</span> at the recorded tier.</p>
+
+    <div class="diagram mt3">
+      <div class="box box-blue">Profiling Run<br><span class="small">warm workload</span></div>
+      <div class="arrow">&#8594;</div>
+      <div class="box box-yellow">Export<br><span class="small">ExportMDOFile</span></div>
+      <div class="arrow">&#8594;</div>
+      <div class="box box-purple">.mdo file<br><span class="small">portable binary</span></div>
+      <div class="arrow">&#8594;</div>
+      <div class="box box-yellow">Import<br><span class="small">ImportMDOFile</span></div>
+      <div class="arrow">&#8594;</div>
+      <div class="box box-green">Install on Link<br><span class="small">on_class_linked</span></div>
+      <div class="arrow">&#8594;</div>
+      <div class="box box-red">Drain<br><span class="small">eager compile</span></div>
+    </div>
+
+    <div class="cols-3 mt3">
+      <div class="card card-blue">
+        <h3 class="accent">Symbolic &amp; Portable</h3>
+        <p class="small">Klass*/Method* stored as names + classloader tags. Profile data as logical (tag, bci, counters) &mdash; not raw DataLayout cells.</p>
+      </div>
+      <div class="card card-green">
+        <h3 class="green">Install-List Architecture</h3>
+        <p class="small">Lock-free linked list records (Method*, tier) at class-link time. Works for <span class="bold">any</span> classloader &mdash; boot, platform, app, or custom.</p>
+      </div>
+      <div class="card card-yellow">
+        <h3 class="yellow">Eager Compile Drain</h3>
+        <p class="small">After a priming iteration loads classes, drain the install-list: queue every method into CompileBroker at its recorded tier, wait for queues to empty.</p>
+      </div>
+    </div>
+  </div>
+  <div class="slide-num">3</div>
+</div>
+
+<!-- ================================================================
+     SLIDE 4 -- Export Path
+     ================================================================ -->
+<div class="slide bg-navy">
+  <div>
+    <p class="subtitle"><span class="accent">&#9679;</span> Phase 1</p>
+    <h1>Export: Capturing Profile State</h1>
+    <div class="cols mt2">
+      <div>
+        <h3 class="accent mb1">How Export Works</h3>
+        <div style="display:flex;flex-direction:column;gap:4px">
+          <div class="box box-gray" style="text-align:left;font-size:.82rem"><code>before_exit()</code> &rarr; <code>PortableMDO::export_on_shutdown()</code></div>
+          <div class="arrow-down">&darr;</div>
+          <div class="box box-yellow" style="text-align:left;font-size:.82rem"><code>VM_ExportMDO</code> safepoint op &mdash; consistent snapshot</div>
+          <div class="arrow-down">&darr;</div>
+          <div class="box box-blue" style="text-align:left;font-size:.82rem">Walk <code>ClassLoaderDataGraph</code> &rarr; collect <span class="hl-blue">mature</span> MDOs only</div>
+          <div class="arrow-down">&darr;</div>
+          <div class="box box-green" style="text-align:left;font-size:.82rem">For each MDO: serialize identity + header + per-BCI records</div>
+          <div class="arrow-down">&darr;</div>
+          <div class="box box-purple" style="text-align:left;font-size:.82rem">Write klass ref table &rarr; method ref table &rarr; patch header</div>
+        </div>
+
+        <div class="card card-yellow mt2">
+          <h3 class="yellow">Deopt Decay</h3>
+          <p class="small">Trap counts scaled by <code>MDOExportDeoptDecayPercent</code> (default 50%).
+             Prevents overly conservative compilation from inherited deopt history.
+             <code>nof_overflow_traps</code> reset to 0.</p>
+        </div>
+      </div>
+      <div>
+        <h3 class="accent mb1">What Gets Serialized</h3>
+        <table>
+          <thead><tr><th>Data</th><th>Purpose for C2</th></tr></thead>
+          <tbody>
+            <tr><td class="mono small">invocation_count</td><td class="small">Method hotness signal</td></tr>
+            <tr><td class="mono small">backedge_count</td><td class="small">Loop hotness signal</td></tr>
+            <tr><td class="mono small">ReceiverTypeData</td><td class="small">Devirtualization (speculative inlining)</td></tr>
+            <tr><td class="mono small">BranchData</td><td class="small">Branch prediction, uncommon trap placement</td></tr>
+            <tr><td class="mono small">CallTypeData</td><td class="small">Argument/return type speculation</td></tr>
+            <tr><td class="mono small">trap_hist[]</td><td class="small">Deopt avoidance (e.g. class_check, null_check)</td></tr>
+            <tr><td class="mono small">highest_comp_level</td><td class="small"><span class="yellow bold">Target tier for eager compile</span></td></tr>
+            <tr><td class="mono small">bytecode_fingerprint</td><td class="small">CRC32 staleness detection</td></tr>
+          </tbody>
+        </table>
+        <div class="card mt2" style="border-left:4px solid #f87171">
+          <h3 class="red">Intentionally Omitted</h3>
+          <p class="small">Escape analysis state (not portable), hidden/lambda classes (elided, overflow counts preserved), raw DataLayout cell addresses.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="slide-num">4</div>
+</div>
+
+<!-- ================================================================
+     SLIDE 5 -- Binary Format
+     ================================================================ -->
+<div class="slide bg-accent">
+  <div>
+    <p class="subtitle"><span class="purple">&#9679;</span> File Format</p>
+    <h1>Binary Layout <span class="mono small" style="color:#64748b">magic: 0x4A4D444F "JMDO"</span></h1>
+    <div class="cols mt2">
+      <div class="file-layout">
+        <div class="file-row" style="background:rgba(56,189,248,.12)">
+          <span class="file-offset">0x00</span>
+          <span class="file-label" style="color:#7dd3fc">PortableMDOFileHeader (52 bytes)</span>
+        </div>
+        <div class="file-row" style="background:rgba(251,191,36,.08)">
+          <span class="file-offset">0x34</span>
+          <span class="file-label" style="color:#fde68a">MDO Entry [0]</span>
+        </div>
+        <div class="file-row" style="background:rgba(251,191,36,.06)">
+          <span class="file-offset">&hellip;</span>
+          <span class="file-label" style="color:#fde68a">MDO Entry [N-1]</span>
+        </div>
+        <div class="file-row" style="background:rgba(74,222,128,.1)">
+          <span class="file-offset">var</span>
+          <span class="file-label" style="color:#86efac">Klass Ref Table (dedup'd)</span>
+        </div>
+        <div class="file-row" style="background:rgba(167,139,250,.1)">
+          <span class="file-offset">var</span>
+          <span class="file-label" style="color:#c4b5fd">Method Ref Table</span>
+        </div>
+      </div>
+      <div>
+        <h3>Per-MDO Entry Structure</h3>
+        <div style="display:flex;flex-direction:column;gap:2px;font-size:.82rem;font-family:'JetBrains Mono',monospace;margin-top:.75rem">
+          <div style="padding:.3rem .6rem;background:rgba(56,189,248,.08);border-radius:.25rem;color:#7dd3fc">MethodIdentity (klass_ref, name, sig, fingerprint)</div>
+          <div style="padding:.3rem .6rem;background:rgba(251,191,36,.08);border-radius:.25rem;color:#fde68a">HeaderFields (counters, deopt, trap_hist, <span class="hl-yellow">highest_comp_level</span>)</div>
+          <div style="padding:.3rem .6rem;background:rgba(74,222,128,.08);border-radius:.25rem;color:#86efac">EntryCounts (records, extras, params, handlers)</div>
+          <div style="padding:.3rem .6rem;background:rgba(167,139,250,.08);border-radius:.25rem;color:#c4b5fd">ProfileRecords[] (tag + bci + payload per record)</div>
+          <div style="padding:.3rem .6rem;background:rgba(248,113,113,.08);border-radius:.25rem;color:#fca5a5">ExtraRecords[] (speculative traps)</div>
+          <div style="padding:.3rem .6rem;background:rgba(148,163,184,.08);border-radius:.25rem;color:#94a3b8">ParameterTypes[] + ExceptionHandlers[]</div>
+        </div>
+        <h3 class="mt2">Klass Ref Entry</h3>
+        <pre style="font-size:.78rem;padding:.6rem"><code><span class="hl-blue">loader_tag</span>  uint8  (BOOT=0, PLATFORM=1, APP=2, CUSTOM=3)
+<span class="hl-green">name_length</span> uint16
+<span class="hl-green">name_bytes</span>  UTF-8  ("java/util/HashMap")</code></pre>
+        <p class="small mt1">13 profile record types supported. All symbolic references
+          resolved at import time. Displacements NOT stored &mdash; recomputed on import.</p>
+      </div>
+    </div>
+  </div>
+  <div class="slide-num">5</div>
+</div>
+
+<!-- ================================================================
+     SLIDE 6 -- Import + Reconstruct
+     ================================================================ -->
+<div class="slide bg-navy">
+  <div>
+    <p class="subtitle"><span class="green">&#9679;</span> Phase 2</p>
+    <h1>Import: Parsing &amp; MDO Reconstruction</h1>
+    <div class="cols mt2">
+      <div>
+        <h3 class="green mb1">Startup: initialize_import()</h3>
+        <ul>
+          <li>Read entire .mdo file into C-heap buffer at VM startup</li>
+          <li>Parse &amp; validate header (magic, JDK version, pointer size, endianness)</li>
+          <li>Parse klass ref table &rarr; intern all Symbol* via SymbolTable</li>
+          <li>Parse MDO entries &rarr; record <span class="bold">byte offsets</span> (don't fully parse yet)</li>
+          <li>Build <code>MDOLookupMap</code>: <span class="mono small">(klass_name, method_name, sig) &rarr; entry_index</span></li>
+        </ul>
+
+        <h3 class="green mb1 mt2">reconstruct_mdo() &mdash; The Core Routine</h3>
+        <p class="small">Called when a matching method is found. Replays imported bytes onto a freshly-allocated MethodData:</p>
+        <ol style="padding-left:1.5rem;font-size:.9rem;color:#94a3b8;margin-top:.5rem">
+          <li style="margin-bottom:.3rem"><span class="accent bold">Allocate</span> fresh MethodData (correct layout, zeroed cells)</li>
+          <li style="margin-bottom:.3rem"><span class="accent bold">Patch header</span>: counters, trap histogram, decompile count, arg_modified</li>
+          <li style="margin-bottom:.3rem"><span class="accent bold">Patch per-BCI records</span>: match by BCI+tag, set counts, resolve klass refs</li>
+          <li style="margin-bottom:.3rem"><span class="accent bold">Patch extra data</span>: speculative trap records with method refs</li>
+          <li style="margin-bottom:.3rem"><span class="accent bold">Patch params &amp; handlers</span>: type entries, exception coverage</li>
+        </ol>
+      </div>
+      <div>
+        <h3 class="green mb1">BCI+Tag Matching Strategy</h3>
+        <pre style="font-size:.78rem"><code><span class="hl-blue">// Walk live MDO and imported records in parallel</span>
+<span class="hl-blue">// Match by BCI + tag, not by position</span>
+
+Live:     BCI 10 counter | Imported: BCI 10 counter
+  <span class="hl-green">&rarr; MATCH: patch counts</span>
+
+Live:     BCI 10 counter | Imported: BCI 15 counter
+  <span class="hl-yellow">&rarr; advance live, re-read imported</span>
+
+Live:     BCI 20         | Imported: BCI 15
+  <span class="hl-red">&rarr; skip stale imported record</span></code></pre>
+        <p class="small mt1">Tolerates bytecode layout changes between runs. If method body changed, fingerprint mismatch skips the entire entry.</p>
+
+        <h3 class="green mb1 mt2">Klass Resolution at Import</h3>
+        <div class="card card-green">
+          <p class="small"><span class="green bold">BOOT / PLATFORM / APP</span>: resolved via
+            <code>SystemDictionary::find_instance_klass()</code> &mdash; lookup only, no class loading.</p>
+          <p class="small mt1"><span class="yellow bold">CUSTOM</span>: cannot be resolved from a stored tag.
+            But <code>on_class_linked</code> doesn't need resolution &mdash; it sees the live class directly.</p>
+        </div>
+
+        <div class="card card-blue mt1">
+          <p class="small"><span class="accent bold">Key insight:</span> Decompile count capped to
+            <code>PerMethodRecompilationCutoff</code> to prevent accidentally marking methods as not-compilable
+            from stale deopt history.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="slide-num">6</div>
+</div>
+
+<!-- ================================================================
+     SLIDE 7 -- Install-List Architecture
+     ================================================================ -->
+<div class="slide bg-accent">
+  <div>
+    <p class="subtitle"><span class="yellow">&#9679;</span> Phase 3</p>
+    <h1>Install-List: The Bridge Between Import and Compile</h1>
+    <div class="cols mt2">
+      <div>
+        <h3 class="yellow mb1">The Problem with Direct Compilation</h3>
+        <p class="small">We can't compile methods inline from <code>InstanceKlass::link_class_impl()</code>:</p>
+        <ul class="red mt1">
+          <li>Compilation on the class-loading thread can <span class="bold">deadlock</span> against CompileBroker locks</li>
+          <li>Custom-loader classes (Spring, DaCapo, Lambda) can't be pre-resolved by name &mdash; we need the actual loaded class</li>
+          <li>We want to batch all compilations and <span class="bold">wait</span> for queues to drain before measuring</li>
+        </ul>
+
+        <h3 class="yellow mb1 mt2">Solution: Install Then Compile</h3>
+        <div class="diagram" style="justify-content:flex-start">
+          <div class="box box-green" style="font-size:.8rem">Class links<br><span class="small">any thread</span></div>
+          <div class="arrow">&rarr;</div>
+          <div class="box box-yellow" style="font-size:.8rem">on_class_linked<br><span class="small">install MDO</span></div>
+          <div class="arrow">&rarr;</div>
+          <div class="box box-purple" style="font-size:.8rem">Install-List<br><span class="small">(Method*, tier)</span></div>
+          <div class="arrow">&rarr;</div>
+          <div class="box box-red" style="font-size:.8rem">Drain<br><span class="small">eager compile</span></div>
+        </div>
+      </div>
+      <div>
+        <h3 class="yellow mb1">Lock-Free Linked List</h3>
+        <pre style="font-size:.78rem"><code>struct <span class="hl-yellow">InstallRecord</span> {
+  Method*        method;
+  uint8_t        level;   <span class="hl-blue">// CompLevel from export</span>
+  InstallRecord* next;
+};
+
+static InstallRecord* volatile <span class="hl-yellow">_install_list_head</span>;
+
+<span class="hl-blue">// Many writers (any classloading thread)</span>
+void <span class="hl-green">install_list_append</span>(Method* m, uint8_t level) {
+  InstallRecord* rec = new InstallRecord{m, level};
+  InstallRecord* old_head;
+  do {
+    old_head = Atomic::load(&_install_list_head);
+    rec->next = old_head;
+  } while (<span class="hl-yellow">Atomic::cmpxchg</span>(&_install_list_head,
+            old_head, rec) != old_head);
+}
+
+<span class="hl-blue">// Single reader (drain thread)</span>
+InstallRecord* <span class="hl-green">install_list_take_all</span>() {
+  return <span class="hl-yellow">Atomic::xchg</span>(&_install_list_head,
+                       nullptr);
+}</code></pre>
+        <div class="card card-yellow mt1">
+          <p class="small"><span class="yellow bold">Concurrency:</span> CAS-based push (many writers), atomic take-all (single drain reader).
+            No mutexes needed. Liveness checked at drain time via <code>ClassLoaderData::is_alive()</code>.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="slide-num">7</div>
+</div>
+
+<!-- ================================================================
+     SLIDE 8 -- on_class_linked
+     ================================================================ -->
+<div class="slide bg-navy">
+  <div>
+    <p class="subtitle"><span class="accent">&#9679;</span> Hook Point</p>
+    <h1>on_class_linked: Where MDOs Meet Live Classes</h1>
+    <div class="cols mt2">
+      <div>
+        <h3 class="accent mb1">Integration in InstanceKlass</h3>
+        <pre style="font-size:.78rem"><code><span class="hl-blue">// instanceKlass.cpp, link_class_impl()</span>
+<span class="hl-blue">// Fires for EVERY class after linking completes</span>
+
+bool InstanceKlass::link_class_impl(TRAPS) {
+  ...  <span class="hl-blue">// verification, rewriting, linking</span>
+  set_init_state(linked);
+
+  <span class="hl-green">// NEW: install imported MDO profiles</span>
+  <span class="hl-green">PortableMDO::on_class_linked(this, THREAD);</span>
+
+  return true;
+}</code></pre>
+
+        <h3 class="accent mb1 mt2">What on_class_linked Does</h3>
+        <ol style="padding-left:1.5rem;font-size:.9rem;color:#94a3b8">
+          <li style="margin-bottom:.3rem">Walk all methods in the newly-linked class</li>
+          <li style="margin-bottom:.3rem">Look up each in the import <code>MDOLookupMap</code></li>
+          <li style="margin-bottom:.3rem">Validate bytecode fingerprint (CRC32 match)</li>
+          <li style="margin-bottom:.3rem">Read <code>highest_comp_level</code> from entry header</li>
+          <li style="margin-bottom:.3rem">Skip if level &le; 0 (interpreter-only methods)</li>
+          <li style="margin-bottom:.3rem">Force <code>build_profiling_method_data()</code> &rarr; <code>try_import()</code> &rarr; <code>reconstruct_mdo()</code></li>
+          <li style="margin-bottom:.3rem">Append <code>(Method*, level)</code> to install-list</li>
+        </ol>
+      </div>
+      <div>
+        <h3 class="accent mb1">Why This Solves Custom Classloaders</h3>
+        <div class="card card-green">
+          <p class="small"><span class="green bold">Key insight:</span> We never need to <em>find</em> a custom-loaded class by name.
+            We wait for it to come to us. When DaCapo's <code>DacapoClassLoader</code>, Spring's
+            <code>LaunchedURLClassLoader</code>, or any custom loader links a class,
+            <code>on_class_linked</code> fires with the real <code>InstanceKlass*</code> in hand.</p>
+        </div>
+
+        <div class="card card-blue mt1">
+          <h3 class="accent">Coverage by Loader Type</h3>
+          <table style="font-size:.85rem;margin-top:.5rem">
+            <thead><tr><th>Loader</th><th>Resolved?</th><th>Installed?</th></tr></thead>
+            <tbody>
+              <tr><td>Boot (java.*)</td><td class="green">yes</td><td class="green">yes</td></tr>
+              <tr><td>Platform</td><td class="green">yes</td><td class="green">yes</td></tr>
+              <tr><td>App</td><td class="green">yes</td><td class="green">yes</td></tr>
+              <tr><td>Custom (DaCapo, Spring)</td><td class="red">no</td><td class="green bold">yes</td></tr>
+            </tbody>
+          </table>
+          <p class="small mt1">Custom-loader holders can't be resolved from a stored loader tag,
+            but <code>on_class_linked</code> catches them when they're loaded. Install-list
+            carries the live <code>Method*</code> acquired through the correct loader.</p>
+        </div>
+
+        <div class="card card-purple mt1">
+          <p class="small"><span class="purple bold">Example:</span> h2 benchmark &mdash; 750 <code>org.h2.*</code> methods
+            loaded via DacapoClassLoader, all installed via <code>on_class_linked</code>, zero resolved by name.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="slide-num">8</div>
+</div>
+
+<!-- ================================================================
+     SLIDE 9 -- Eager Compile Drain
+     ================================================================ -->
+<div class="slide bg-accent">
+  <div>
+    <p class="subtitle"><span class="red">&#9679;</span> Phase 4</p>
+    <h1>Eager Compile Drain</h1>
+    <div class="cols mt2">
+      <div>
+        <h3 class="red mb1">eager_compile_imported_methods()</h3>
+        <pre style="font-size:.75rem"><code>void PortableMDO::eager_compile_imported_methods(TRAPS) {
+  <span class="hl-blue">// Atomically take the entire install-list</span>
+  InstallRecord* head = <span class="hl-yellow">install_list_take_all()</span>;
+
+  while (head != nullptr) {
+    InstallRecord* rec = head;
+    head = head->next;
+    Method* m = rec->method;
+
+    <span class="hl-blue">// Liveness guard: skip if classloader unloaded</span>
+    ClassLoaderData* cld = m->method_holder()
+                            ->class_loader_data();
+    if (cld == nullptr || !cld->is_alive()) {
+      skipped_dead++; delete rec; continue;
+    }
+    if (m->method_data() == nullptr) {
+      skipped_no_mdo++; delete rec; continue;
+    }
+
+    <span class="hl-green">// Queue at the RECORDED tier</span>
+    CompileBroker::compile_method(
+      mh, InvocationEntryBci,
+      <span class="hl-yellow">(CompLevel)rec->level</span>,  <span class="hl-blue">// C1=3 or C2=4</span>
+      0, CompileTask::Reason_MustBeCompiled, THREAD);
+    compiled++;
+    delete rec;
+  }
+
+  <span class="hl-blue">// Block until both queues are empty</span>
+  for (;;) {
+    CompileBroker::<span class="hl-yellow">wait_for_no_active_tasks()</span>;
+    if (c1_queue->is_empty() && c2_queue->is_empty())
+      break;
+    os::naked_short_sleep(1);
+  }
+}</code></pre>
+      </div>
+      <div>
+        <h3 class="red mb1">Design Decisions</h3>
+        <div class="card card-yellow">
+          <h3 class="yellow">Replays Recorded Tier, Not Blanket C2</h3>
+          <p class="small mt1">Each method is compiled at the tier it <em>organically reached</em> in the profiling run.
+            A method that only made it to C1 (level 3) stays C1. Only methods that reached C2 (level 4)
+            get C2. Level 0 (interpreter) is skipped entirely.</p>
+        </div>
+
+        <div class="card card-blue mt1">
+          <h3 class="accent">JNI Bridge</h3>
+          <pre style="font-size:.75rem;padding:.5rem"><code><span class="hl-blue">// jvm.cpp</span>
+JVM_ENTRY(void, JVM_WaitForEagerCompilation(...))
+  PortableMDO::eager_compile_imported_methods(THREAD);
+JVM_END
+
+<span class="hl-blue">// jdk.internal.misc.VM.java</span>
+public static native void waitForEagerCompilation();</code></pre>
+        </div>
+
+        <div class="card card-green mt1">
+          <h3 class="green">Drain Timing (DaCapo)</h3>
+          <table style="font-size:.85rem;margin-top:.5rem">
+            <thead><tr><th>Benchmark</th><th>Queued</th><th>Drain Time</th></tr></thead>
+            <tbody>
+              <tr><td>h2</td><td class="bold">322</td><td>112 ms</td></tr>
+              <tr><td>eclipse</td><td class="bold">560</td><td>145 ms</td></tr>
+              <tr><td>kafka</td><td class="bold">1,013</td><td>173 ms</td></tr>
+              <tr><td>avrora</td><td class="bold">~250</td><td>~100 ms</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="slide-num">9</div>
+</div>
+
+<!-- ================================================================
+     SLIDE 10 -- Priming Iteration & Serverless Analogy
+     ================================================================ -->
+<div class="slide bg-navy">
+  <div>
+    <p class="subtitle"><span class="orange">&#9679;</span> Execution Model</p>
+    <h1>The Priming Iteration</h1>
+    <div class="cols mt2">
+      <div>
+        <h3 class="orange mb1">DaCapo Callback Architecture</h3>
+        <pre style="font-size:.78rem"><code><span class="hl-blue">// PortableMDODrainCallback.java</span>
+public class PortableMDODrainCallback
+    extends Callback {
+
+  private int completedIterations = 0;
+  private boolean drained = false;
+
+  @Override
+  public void <span class="hl-yellow">stop</span>(long duration) {
+    super.stop(duration);
+    completedIterations++;
+    if (drained) return;
+    if (completedIterations < 1) return;
+    drained = true;
+
+    <span class="hl-green">// After iter 1: drain the install-list</span>
+    long t0 = System.nanoTime();
+    <span class="hl-yellow">VM.waitForEagerCompilation();</span>
+    long ms = (System.nanoTime() - t0) / 1_000_000;
+    System.out.println("Drain complete: " + ms + " ms");
+  }
+}</code></pre>
+      </div>
+      <div>
+        <h3 class="orange mb1">Serverless Analogy</h3>
+        <div style="display:flex;flex-direction:column;gap:6px">
+          <div class="card card-blue" style="padding:.6rem 1rem">
+            <span class="accent bold">Container Start</span>
+            <span class="small"> &mdash; VM boots, reads .mdo, builds lookup map</span>
+          </div>
+          <div class="card card-yellow" style="padding:.6rem 1rem">
+            <span class="yellow bold">First Request (= Iter 1)</span>
+            <span class="small"> &mdash; classes link, MDOs install via on_class_linked</span>
+          </div>
+          <div class="card card-red" style="padding:.6rem 1rem">
+            <span class="red bold">Drain</span>
+            <span class="small"> &mdash; between request 1 and 2: compile everything, wait for queues</span>
+          </div>
+          <div class="card card-green" style="padding:.6rem 1rem">
+            <span class="green bold">Request 2+ (= Iter 2+)</span>
+            <span class="small"> &mdash; fully compiled code in place, steady-state performance</span>
+          </div>
+        </div>
+
+        <div class="card card-orange mt2">
+          <h3 class="orange">Why We Need A Priming Iteration</h3>
+          <p class="small mt1">Custom classloaders (DaCapo's <code>DacapoClassLoader</code>, Spring's app loader) don't
+            load benchmark classes until the workload actually runs. We need at least one
+            pass through the workload to <span class="bold">trigger class linking</span> so <code>on_class_linked</code>
+            can fire and populate the install-list.</p>
+          <p class="small mt1">The priming iter IS the cold-start request &mdash; paid once per container lifetime.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="slide-num">10</div>
+</div>
+
+<!-- ================================================================
+     SLIDE 11 -- Results: h2 deep dive
+     ================================================================ -->
+<div class="slide bg-results">
+  <div>
+    <p class="subtitle"><span class="green">&#9679;</span> Results</p>
+    <h1>h2 Database: <span class="green">1.51x First-Iter Speedup</span></h1>
+    <div class="cols mt2">
+      <div>
+        <h3 class="accent mb1">Iteration Curves (ms, lower is better)</h3>
+        <table style="font-size:.9rem">
+          <thead><tr><th>Iter</th><th>Cold</th><th>Warm</th><th>Speedup</th></tr></thead>
+          <tbody>
+            <tr><td>1</td><td class="red bold">118</td><td class="green bold">78</td><td class="green">1.51x</td></tr>
+            <tr><td>2</td><td>68</td><td>37</td><td class="green">1.84x</td></tr>
+            <tr><td>3</td><td>62</td><td>32</td><td class="green">1.94x</td></tr>
+            <tr><td>4</td><td>46</td><td>28</td><td class="green">1.64x</td></tr>
+            <tr><td>5</td><td>32</td><td>26</td><td class="green">1.23x</td></tr>
+            <tr><td>6</td><td>27</td><td>29</td><td>0.93x</td></tr>
+            <tr><td>7</td><td>28</td><td>24</td><td class="green">1.17x</td></tr>
+            <tr><td>8</td><td>24</td><td>22</td><td class="green">1.09x</td></tr>
+            <tr><td>9</td><td>26</td><td>19</td><td class="green bold">1.37x</td></tr>
+            <tr><td>10</td><td>24</td><td>17</td><td class="green bold">1.41x</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div>
+        <div class="cols-3" style="margin-top:0">
+          <div class="big-stat"><div class="num green">1.51x</div><div class="label">1st iter speedup</div></div>
+          <div class="big-stat"><div class="num accent">322</div><div class="label">methods compiled</div></div>
+          <div class="big-stat"><div class="num yellow">112ms</div><div class="label">drain time</div></div>
+        </div>
+
+        <div class="card card-green mt2">
+          <h3 class="green">Why h2 Benefits Most</h3>
+          <ul class="green mt1" style="font-size:.85rem">
+            <li><span class="bold">Long cold ramp:</span> cold takes 7 iterations to reach optimal &mdash; large window to compress</li>
+            <li><span class="bold">Concentrated hot set:</span> 750 <code>org.h2.*</code> methods are the benchmark's core</li>
+            <li><span class="bold">Lower warm asymptote:</span> warm reaches 17ms vs cold's 24ms at iter 10 &mdash; C2 with imported MDO finds a <em>better</em> steady state</li>
+          </ul>
+        </div>
+
+        <div class="card card-blue mt1">
+          <h3 class="accent">MDO Coverage</h3>
+          <p class="small">1,659 exported &rarr; 1,517 reconstructed &rarr; 322 queued for drain.
+            750 app (org.h2), 724 JDK, 39 org.apache, 4 org.dacapo.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="slide-num">11</div>
+</div>
+
+<!-- ================================================================
+     SLIDE 12 -- Results: Multi-benchmark
+     ================================================================ -->
+<div class="slide bg-results">
+  <div>
+    <p class="subtitle"><span class="green">&#9679;</span> Results</p>
+    <h1>Cross-Benchmark Comparison</h1>
+    <div class="cols mt2">
+      <div>
+        <table>
+          <thead><tr><th>Benchmark</th><th>1st Iter</th><th>Mean</th><th>Cold&rarr;Opt</th><th>Warm&rarr;Opt</th><th>Drain</th></tr></thead>
+          <tbody>
+            <tr>
+              <td class="bold">avrora</td>
+              <td class="green bold">2.83x</td>
+              <td class="green">1.65x</td>
+              <td>3 iters</td>
+              <td class="green bold">0 iters</td>
+              <td>~250</td>
+            </tr>
+            <tr>
+              <td class="bold">lusearch</td>
+              <td class="green bold">6.92x</td>
+              <td class="green">4.85x</td>
+              <td>6 iters</td>
+              <td>8 iters</td>
+              <td>~379</td>
+            </tr>
+            <tr>
+              <td class="bold">h2</td>
+              <td class="green bold">1.51x</td>
+              <td class="green">1.41x</td>
+              <td>7 iters</td>
+              <td>9 iters</td>
+              <td>322</td>
+            </tr>
+            <tr>
+              <td class="bold">eclipse</td>
+              <td class="green">1.02x</td>
+              <td class="green">1.11x</td>
+              <td>5 iters</td>
+              <td class="green bold">2 iters</td>
+              <td>5,596</td>
+            </tr>
+            <tr>
+              <td class="bold">kafka</td>
+              <td>1.00x</td>
+              <td>1.00x</td>
+              <td>0 iters</td>
+              <td>0 iters</td>
+              <td>1,013</td>
+            </tr>
+          </tbody>
+        </table>
+        <p class="small mt1">avrora, lusearch, h2 at <code>-s small</code>. eclipse at <code>-s default</code>. kafka at both sizes.</p>
+      </div>
+      <div>
+        <div class="card card-green">
+          <h3 class="green">Where MDO Wins</h3>
+          <ul class="green" style="font-size:.85rem">
+            <li><span class="bold">avrora:</span> warm curve flat from iter 1 (warm_time_to_optimal=0). MDO eliminates the entire ramp.</li>
+            <li><span class="bold">lusearch:</span> 6.92x first-iter speedup. Cold spends 6 iters ramping; warm delivers near-optimal immediately.</li>
+            <li><span class="bold">h2:</span> Durable speedup even at steady state. C2 with imported profiles reaches a better optimum.</li>
+            <li><span class="bold">eclipse:</span> 3 fewer iterations to optimum. Warm curve is visibly smoother.</li>
+          </ul>
+        </div>
+        <div class="card card-red mt1">
+          <h3 class="red">Where MDO Doesn't Help</h3>
+          <ul class="red" style="font-size:.85rem">
+            <li><span class="bold">kafka:</span> zero JIT ramp even cold. Benchmark is IO/network-bound, not JIT-bound. 1,013 compiled methods don't matter because JIT isn't the bottleneck.</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="slide-num">12</div>
+</div>
+
+<!-- ================================================================
+     SLIDE 13 -- Results: Eclipse & Kafka Analysis
+     ================================================================ -->
+<div class="slide bg-results">
+  <div>
+    <p class="subtitle"><span class="orange">&#9679;</span> Analysis</p>
+    <h1>Benchmark Size Matters: <code>-s small</code> vs <code>-s default</code></h1>
+    <div class="cols mt2">
+      <div>
+        <h3 class="accent mb1">Eclipse: Hidden by Noise at Small</h3>
+        <table style="font-size:.85rem">
+          <thead><tr><th></th><th>-s small</th><th>-s default</th></tr></thead>
+          <tbody>
+            <tr><td>1st iter speedup</td><td>1.14x</td><td class="green bold">1.02x</td></tr>
+            <tr><td>Mean speedup</td><td>1.02x</td><td class="green bold">1.11x</td></tr>
+            <tr><td>Cold&rarr;optimal</td><td>5 iters</td><td>5 iters</td></tr>
+            <tr><td>Warm&rarr;optimal</td><td>9 iters</td><td class="green bold">2 iters</td></tr>
+            <tr><td>Iter time</td><td>~100ms</td><td>~7,000ms</td></tr>
+            <tr><td>MDOs reconstructed</td><td>2,697</td><td class="green bold">5,596</td></tr>
+          </tbody>
+        </table>
+        <div class="card card-green mt1">
+          <p class="small">At <code>-s default</code>, each iteration exercises the code long enough
+            for JIT warmup to actually matter. Warm reaches steady state <span class="bold green">3 iterations earlier</span>
+            and avoids the cold curve's noisy spikes.</p>
+        </div>
+      </div>
+      <div>
+        <h3 class="accent mb1">Kafka: IO-Bound, Not JIT-Bound</h3>
+        <table style="font-size:.85rem">
+          <thead><tr><th></th><th>-s small</th><th>-s default</th></tr></thead>
+          <tbody>
+            <tr><td>1st iter speedup</td><td>1.13x</td><td>1.00x</td></tr>
+            <tr><td>Mean speedup</td><td>1.13x</td><td>1.00x</td></tr>
+            <tr><td>Cold&rarr;optimal</td><td>4 iters</td><td class="red bold">0 iters</td></tr>
+            <tr><td>Warm&rarr;optimal</td><td>4 iters</td><td class="red bold">0 iters</td></tr>
+            <tr><td>Iter time</td><td>~25ms</td><td>~4,900ms</td></tr>
+          </tbody>
+        </table>
+        <div class="card card-red mt1">
+          <p class="small">At <code>-s default</code>, every iteration is ~4,900ms with zero ramp.
+            Cold <em>already reaches optimal at iter 1</em>. The bottleneck is network/IO scheduling,
+            not JIT compilation. MDO correctly installs and compiles 1,013 methods &mdash; they just
+            don't appear on the hot path.</p>
+          <p class="small mt1"><span class="yellow bold">Honest negative result:</span> useful for
+            the paper to demonstrate MDO helps JIT-bound workloads, not IO-bound ones.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="slide-num">13</div>
+</div>
+
+<!-- ================================================================
+     SLIDE 14 -- Design Decisions
+     ================================================================ -->
+<div class="slide bg-navy">
+  <div>
+    <p class="subtitle"><span class="accent">&#9679;</span> Design</p>
+    <h1>Key Engineering Choices</h1>
+    <div class="cols-3 mt2">
+      <div class="card card-blue">
+        <h3 class="accent">Logical vs Raw Format</h3>
+        <p class="small mt1">Serialize at the logical level (tag + bci + typed counters) rather
+           than raw DataLayout cells. Independent of TypeProfileWidth, BciProfileWidth,
+           and other flag-dependent cell layouts.</p>
+      </div>
+      <div class="card card-green">
+        <h3 class="green">Install-then-Compile</h3>
+        <p class="small mt1">Two-phase design avoids deadlocks: <code>on_class_linked</code> only installs
+           MDOs and records on the list. Compilation is deferred to the explicit drain call
+           from a known JavaThread.</p>
+      </div>
+      <div class="card card-yellow">
+        <h3 class="yellow">Replay Recorded Tier</h3>
+        <p class="small mt1">Each method compiled at its profiling-run tier, not blanket C2.
+           C1-only methods stay C1. Level-0 methods skipped. Avoids wasted C2 time on methods
+           that didn't warrant it.</p>
+      </div>
+      <div class="card card-purple">
+        <h3 class="purple">Fingerprint Gating</h3>
+        <p class="small mt1">CRC32 over bytecodes prevents stale profile application.
+           If class evolves between runs, method is silently skipped &mdash; no crash, no
+           misspeculation from wrong profile.</p>
+      </div>
+      <div class="card card-orange">
+        <h3 class="orange">Hidden Class Elision</h3>
+        <p class="small mt1">Lambda/invokedynamic classes discarded from receiver type profiles.
+           Overflow counts preserved so C2 still knows call sites are polymorphic/hot
+           without needing to serialize unpredictable class identities.</p>
+      </div>
+      <div class="card card-red">
+        <h3 class="red">Safepoint Export</h3>
+        <p class="small mt1">Export runs as a VM_Operation at shutdown safepoint. Consistent
+           MDO state guaranteed &mdash; no concurrent mutations. Deopt counts decayed
+           by configurable factor (default 50%).</p>
+      </div>
+    </div>
+  </div>
+  <div class="slide-num">14</div>
+</div>
+
+<!-- ================================================================
+     SLIDE 15 -- JVM Flags & Integration
+     ================================================================ -->
+<div class="slide bg-accent">
+  <div>
+    <p class="subtitle"><span class="purple">&#9679;</span> API</p>
+    <h1>JVM Flags &amp; Integration Points</h1>
+    <div class="cols mt2">
+      <div>
+        <h3 class="purple mb1">New Diagnostic Flags</h3>
+        <table style="font-size:.9rem">
+          <thead><tr><th>Flag</th><th>Default</th><th>Purpose</th></tr></thead>
+          <tbody>
+            <tr><td class="mono small accent">ExportMDOFile</td><td>null</td><td class="small">Export mature MDO profiles to this file at shutdown</td></tr>
+            <tr><td class="mono small accent">ImportMDOFile</td><td>null</td><td class="small">Import MDO profiles from this file at startup</td></tr>
+            <tr><td class="mono small accent">EagerCompilePortableMDO</td><td>false</td><td class="small">Enable on_class_linked hook &amp; install-list</td></tr>
+            <tr><td class="mono small accent">MDOExportDeoptDecayPercent</td><td>50</td><td class="small">Decay factor for deopt counts at export (0-100)</td></tr>
+          </tbody>
+        </table>
+        <p class="small mt1">All require <code>-XX:+UnlockDiagnosticVMOptions</code>.</p>
+
+        <h3 class="purple mb1 mt2">Usage Examples</h3>
+        <pre style="font-size:.75rem"><code><span class="hl-blue"># Profiling run</span>
+java -XX:+UnlockDiagnosticVMOptions \
+  -XX:ExportMDOFile=profile.mdo \
+  -XX:MDOExportDeoptDecayPercent=50 \
+  -jar myapp.jar
+
+<span class="hl-blue"># Warm run</span>
+java -XX:+UnlockDiagnosticVMOptions \
+  -XX:ImportMDOFile=profile.mdo \
+  -XX:+EagerCompilePortableMDO \
+  -jar myapp.jar</code></pre>
+      </div>
+      <div>
+        <h3 class="purple mb1">Files Modified</h3>
+        <table style="font-size:.85rem">
+          <thead><tr><th>File</th><th>Role</th></tr></thead>
+          <tbody>
+            <tr><td class="mono small" style="color:#7dd3fc">portableMDO.hpp/cpp</td><td class="small">Format, export, import, install-list, drain</td></tr>
+            <tr><td class="mono small" style="color:#fde68a">globals.hpp</td><td class="small">4 new diagnostic flags</td></tr>
+            <tr><td class="mono small" style="color:#86efac">instanceKlass.cpp</td><td class="small">on_class_linked hook call</td></tr>
+            <tr><td class="mono small" style="color:#86efac">threads.cpp</td><td class="small">initialize_import at VM boot</td></tr>
+            <tr><td class="mono small" style="color:#86efac">java.cpp</td><td class="small">export_on_shutdown + shutdown_import</td></tr>
+            <tr><td class="mono small" style="color:#86efac">method.cpp</td><td class="small">try_import in build_profiling_method_data</td></tr>
+            <tr><td class="mono small" style="color:#c4b5fd">jvm.cpp</td><td class="small">JVM_WaitForEagerCompilation native</td></tr>
+            <tr><td class="mono small" style="color:#c4b5fd">VM.java / VM.c</td><td class="small">waitForEagerCompilation() JNI bridge</td></tr>
+          </tbody>
+        </table>
+
+        <div class="card card-purple mt2">
+          <h3 class="purple">Java API</h3>
+          <pre style="font-size:.75rem;padding:.5rem"><code><span class="hl-blue">// jdk.internal.misc.VM</span>
+public static native void <span class="hl-green">waitForEagerCompilation</span>();
+<span class="hl-blue">// Drains install-list, queues compilations,</span>
+<span class="hl-blue">// blocks until C1+C2 queues are empty</span></code></pre>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="slide-num">15</div>
+</div>
+
+<!-- ================================================================
+     SLIDE 16 -- Full Pipeline Diagram
+     ================================================================ -->
+<div class="slide bg-navy">
+  <div>
+    <p class="subtitle"><span class="accent">&#9679;</span> Architecture</p>
+    <h1>End-to-End Pipeline</h1>
+
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:1.5rem;margin-top:2rem">
+      <!-- Column 1: Profiling Run -->
+      <div>
+        <h3 class="accent mb1" style="text-align:center">Profiling Run (JVM 1)</h3>
+        <div style="display:flex;flex-direction:column;gap:4px">
+          <div class="box box-blue" style="text-align:left;font-size:.78rem">Application executes workload</div>
+          <div class="arrow-down">&darr;</div>
+          <div class="box box-blue" style="text-align:left;font-size:.78rem">JIT collects MDOs organically<br><span class="small">interpreter &rarr; C1 &rarr; C2 ramp</span></div>
+          <div class="arrow-down">&darr;</div>
+          <div class="box box-yellow" style="text-align:left;font-size:.78rem">Shutdown: VM_ExportMDO safepoint<br><span class="small">collect mature MDOs</span></div>
+          <div class="arrow-down">&darr;</div>
+          <div class="box box-purple" style="text-align:left;font-size:.78rem">Write .mdo file<br><span class="small">entries + klass refs + method refs</span></div>
+        </div>
+      </div>
+
+      <!-- Column 2: Import -->
+      <div>
+        <h3 class="green mb1" style="text-align:center">Warm Run Startup (JVM 2)</h3>
+        <div style="display:flex;flex-direction:column;gap:4px">
+          <div class="box box-green" style="text-align:left;font-size:.78rem">VM boot: initialize_import()<br><span class="small">parse file, build MDOLookupMap</span></div>
+          <div class="arrow-down">&darr;</div>
+          <div class="box box-green" style="text-align:left;font-size:.78rem">App starts (Iter 1 = priming)<br><span class="small">classes begin linking</span></div>
+          <div class="arrow-down">&darr;</div>
+          <div class="box box-yellow" style="text-align:left;font-size:.78rem">on_class_linked fires per class<br><span class="small">lookup &rarr; fingerprint &rarr; reconstruct MDO</span></div>
+          <div class="arrow-down">&darr;</div>
+          <div class="box box-purple" style="text-align:left;font-size:.78rem">Append (Method*, level) to install-list<br><span class="small">lock-free CAS push</span></div>
+        </div>
+      </div>
+
+      <!-- Column 3: Drain -->
+      <div>
+        <h3 class="red mb1" style="text-align:center">Drain &amp; Steady State</h3>
+        <div style="display:flex;flex-direction:column;gap:4px">
+          <div class="box box-red" style="text-align:left;font-size:.78rem">Iter 1 completes &rarr; callback.stop()<br><span class="small">VM.waitForEagerCompilation()</span></div>
+          <div class="arrow-down">&darr;</div>
+          <div class="box box-red" style="text-align:left;font-size:.78rem">Drain: take_all &rarr; CompileBroker<br><span class="small">queue each method at recorded tier</span></div>
+          <div class="arrow-down">&darr;</div>
+          <div class="box box-red" style="text-align:left;font-size:.78rem">Wait for C1+C2 queues to empty<br><span class="small">~100-170ms for DaCapo workloads</span></div>
+          <div class="arrow-down">&darr;</div>
+          <div class="box box-green" style="text-align:left;font-size:.78rem"><span class="hl-green">Iter 2+: fully compiled code</span><br><span class="small">all hot methods at target tier</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="slide-num">16</div>
+</div>
+
+<!-- ================================================================
+     SLIDE 17 -- Limitations & Risks
+     ================================================================ -->
+<div class="slide bg-problem">
+  <div>
+    <p class="subtitle"><span class="red">&#9679;</span> Limitations</p>
+    <h1>Risks &amp; Open Questions</h1>
+    <div class="cols-3 mt2">
+      <div class="card card-red">
+        <h3 class="red">Workload Drift</h3>
+        <p class="small mt1">Imported profiles reflect the <em>profiling run's</em> behavior. If the warm run
+           exercises different code paths, C2 may speculate wrong based on stale branch ratios
+           or receiver types &mdash; leading to <span class="bold">deoptimization + recompile</span>, potentially
+           worse than clean cold start.</p>
+      </div>
+      <div class="card card-yellow">
+        <h3 class="yellow">Code Cache Pressure</h3>
+        <p class="small mt1">Drain dumps hundreds of compiled methods at once. If the warm run's actual
+           hot set differs, we've pre-filled the code cache with the wrong methods. May cause
+           eviction of methods that matter in the new workload.</p>
+      </div>
+      <div class="card card-orange">
+        <h3 class="orange">Drain Cost</h3>
+        <p class="small mt1">Drain blocks for 100-170ms. For serverless where each request is ~50ms (kafka),
+           the drain cost exceeds multiple request latencies. Must be amortized over many
+           subsequent requests to break even. Not always viable for very short-lived containers.</p>
+      </div>
+      <div class="card card-purple">
+        <h3 class="purple">IO-Bound Irrelevance</h3>
+        <p class="small mt1">Kafka demonstrates that MDO can't help when JIT isn't the bottleneck.
+           IO/network/scheduling-dominated workloads see zero benefit regardless of how
+           many methods we compile. Need per-workload analysis.</p>
+      </div>
+      <div class="card card-blue">
+        <h3 class="accent">Fingerprint is Bytecode-Only</h3>
+        <p class="small mt1">CRC32 catches class-body changes but not "same code, different inputs."
+           If a method's call-site distribution changes (new subtypes at a virtual call),
+           imported profiles will mislead C2 until deopt+reprofile corrects it.</p>
+      </div>
+      <div class="card card-green">
+        <h3 class="green">Benchmark Size Sensitivity</h3>
+        <p class="small mt1">At <code>-s small</code>, workloads run too briefly per iteration for JIT
+           effects to dominate. Eclipse looked like "no speedup" at small but showed
+           <span class="bold">1.11x / 3-iter compression</span> at default. Paper must control for this.</p>
+      </div>
+    </div>
+  </div>
+  <div class="slide-num">17</div>
+</div>
+
+<!-- ================================================================
+     SLIDE 18 -- Conclusion & Future Work
+     ================================================================ -->
+<div class="slide bg-dark">
+  <div>
+    <p class="subtitle"><span class="accent">&#9679;</span> Conclusion</p>
+    <h1>Summary &amp; Future Directions</h1>
+    <div class="cols mt2">
+      <div>
+        <h3 class="green mb1">What We Built</h3>
+        <ul class="green">
+          <li>Complete Portable MDO binary format: logical, symbolic, portable</li>
+          <li>Safepoint-safe exporter with deopt decay (13 profile data types)</li>
+          <li>Lazy importer with fingerprint validation &amp; MDO reconstruction</li>
+          <li>Lock-free install-list for cross-loader method tracking</li>
+          <li>Eager compile drain with CompileBroker queue wait</li>
+          <li>JNI bridge: <code>VM.waitForEagerCompilation()</code></li>
+          <li>DaCapo callback integration with priming iteration model</li>
+        </ul>
+
+        <h3 class="yellow mb1 mt2">Key Results</h3>
+        <div style="display:flex;gap:.75rem;flex-wrap:wrap">
+          <div class="big-stat card" style="padding:.6rem 1rem"><div class="num green" style="font-size:2rem">6.92x</div><div class="label">lusearch 1st iter</div></div>
+          <div class="big-stat card" style="padding:.6rem 1rem"><div class="num green" style="font-size:2rem">2.83x</div><div class="label">avrora 1st iter</div></div>
+          <div class="big-stat card" style="padding:.6rem 1rem"><div class="num green" style="font-size:2rem">1.51x</div><div class="label">h2 1st iter</div></div>
+          <div class="big-stat card" style="padding:.6rem 1rem"><div class="num accent" style="font-size:2rem">1.11x</div><div class="label">eclipse mean</div></div>
+        </div>
+      </div>
+      <div>
+        <h3 class="accent mb1">Future Work</h3>
+        <ul>
+          <li><span class="bold">Multi-trial evaluation</span> &mdash; 5+ trials with confidence intervals for publication-quality results</li>
+          <li><span class="bold">Larger workloads</span> &mdash; <code>-s large</code>, Spring Boot, Quarkus cold-start benchmarks</li>
+          <li><span class="bold">Deopt rate monitoring</span> &mdash; measure how often imported profiles cause misspeculation</li>
+          <li><span class="bold">Selective import</span> &mdash; only install top-N hottest methods, reducing drain cost</li>
+          <li><span class="bold">CDS integration</span> &mdash; embed .mdo alongside shared class data for zero-config warm start</li>
+          <li><span class="bold">Cross-version tolerance</span> &mdash; profile migration across minor JDK updates</li>
+          <li><span class="bold">Counter normalization</span> &mdash; scale imported counters to match target JVM's compilation thresholds</li>
+        </ul>
+        <div class="card card-blue mt2">
+          <h3 class="accent">Key Takeaway</h3>
+          <p class="small">Portable MDO eliminates JIT warm-up for <span class="bold">JIT-bound workloads</span>
+            by transferring profiling metadata across JVM instances. The install-list architecture
+            enables this for <span class="bold">any classloader</span> &mdash; including custom loaders
+            used by Spring, Quarkus, and serverless frameworks &mdash; without requiring class
+            pre-resolution or shared memory.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="slide-num">18</div>
+</div>
+
+</div><!-- /deck -->
+
+<!-- Navigation -->
+<div class="nav">
+  <button onclick="prev()" id="btnPrev">&larr; Prev</button>
+  <span class="counter" id="counter">1 / 18</span>
+  <button onclick="next()" id="btnNext">Next &rarr;</button>
+</div>
+
+<script>
+const deck = document.getElementById('deck');
+const total = document.querySelectorAll('.slide').length;
+let current = 0;
+
+function go(n) {
+  current = Math.max(0, Math.min(total - 1, n));
+  deck.style.transform = `translateX(-${current * 100}vw)`;
+  document.getElementById('counter').textContent = `${current + 1} / ${total}`;
+}
+function next() { go(current + 1); }
+function prev() { go(current - 1); }
+
+document.addEventListener('keydown', e => {
+  if (e.key === 'ArrowRight' || e.key === ' ') { e.preventDefault(); next(); }
+  if (e.key === 'ArrowLeft') { e.preventDefault(); prev(); }
+  if (e.key === 'Home') { e.preventDefault(); go(0); }
+  if (e.key === 'End') { e.preventDefault(); go(total - 1); }
+});
+
+// Touch/swipe support
+let touchStartX = 0;
+document.addEventListener('touchstart', e => { touchStartX = e.changedTouches[0].screenX; });
+document.addEventListener('touchend', e => {
+  const diff = touchStartX - e.changedTouches[0].screenX;
+  if (Math.abs(diff) > 50) { diff > 0 ? next() : prev(); }
+});
+</script>
+
+</body>
+</html>

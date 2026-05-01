@@ -81,6 +81,7 @@ friend class ciObjectFactory; \
 #define CI_PACKAGE_ACCESS_TO           \
 friend class ciObjectFactory;          \
 friend class VMStructs;                \
+friend class MDOReplayDump;            \
 friend class ciCallSite;               \
 friend class ciConstantPoolCache;      \
 friend class ciField;                  \
